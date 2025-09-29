@@ -1,0 +1,373 @@
+# Kedro Data Catalog - MLflow Integration
+# 데이터와 메타데이터를 MLflow artifacts로 자동 저장
+
+# YAML 앵커로 MlflowArtifactDataset 타입 정의
+_ARTIFACT: &artifact_type kedro_mlflow.io.artifacts.MlflowArtifactDataset
+_METRICS: &metrics_type kedro_mlflow.io.metrics.MlflowMetricDataset
+
+# =============================================================================
+# 원본 데이터
+# =============================================================================
+raw_data:
+  type: pandas.ParquetDataset
+  filepath: data/01_raw/dataset2.parquet
+  load_args:
+    engine: pyarrow
+
+# =============================================================================
+# 데이터 스트림 (MLflow artifacts로 자동 저장)
+# =============================================================================
+stage_0_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/02_intermediate/stage_0_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_1_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/02_intermediate/stage_1_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_2_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/02_intermediate/stage_2_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_3_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/02_intermediate/stage_3_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_4_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/04_feature/stage_4_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_5_data:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/04_feature/stage_5_data.parquet
+    save_args:
+      engine: pyarrow
+    load_args:
+      engine: pyarrow
+  # DataFrame
+
+stage_6_data:
+  type: *artifact_type
+  dataset:
+    type: partitions.PartitionedDataset
+    path: data/04_feature/stage_6
+    dataset:
+      type: pandas.ParquetDataset
+      save_args:
+        engine: pyarrow
+      load_args:
+        engine: pyarrow
+    filename_suffix: .parquet
+  # {"train": DataFrame, "val": DataFrame, "test": DataFrame}
+
+stage_7_data:
+  type: *artifact_type
+  dataset:
+    type: partitions.PartitionedDataset
+    path: data/04_feature/stage_7
+    dataset:
+      type: pandas.ParquetDataset
+      save_args:
+        engine: pyarrow
+      load_args:
+        engine: pyarrow
+    filename_suffix: .parquet
+  # {"train": DataFrame, "val": DataFrame, "test": DataFrame}
+
+stage_8_data:
+  type: *artifact_type
+  dataset:
+    type: pickle.PickleDataset
+    filepath: data/04_feature/stage_8_data.pkl
+  # {"train": {text, labels}, "val": {...}, "test": {...}} - 딕셔너리 구조이므로 pickle 유지
+
+# =============================================================================
+# 메타데이터 스트림 (MLflow artifacts로 JSON 형식 저장)
+# =============================================================================
+stage_0_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/02_intermediate/stage_0_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # column_mapping, target_column, pipeline_start_time
+
+stage_1_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/02_intermediate/stage_1_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + column_statistics, filtering_stats
+
+stage_2_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/02_intermediate/stage_2_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + data_quality, class_distribution
+
+stage_3_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/02_intermediate/stage_3_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + label_mapping, cleaning_stats
+
+stage_4_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_4_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + feature_engineering_stats, scaling_params
+
+stage_5_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_5_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + feature_columns, feature_selection_info
+
+stage_6_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_6_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + split_stats, split_ratios
+
+stage_7_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_7_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + scaling_info
+
+stage_8_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_8_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # + encoding_config, tokenizer_stats
+
+# =============================================================================
+# MLflow 메트릭 저장 (각 스테이지별 성능 지표)
+# =============================================================================
+# Stage 처리 시간 메트릭
+stage_0_processing_time:
+  type: *metrics_type
+  key: stage_0_processing_time_seconds
+
+stage_1_processing_time:
+  type: *metrics_type
+  key: stage_1_processing_time_seconds
+
+stage_2_processing_time:
+  type: *metrics_type
+  key: stage_2_processing_time_seconds
+
+stage_3_processing_time:
+  type: *metrics_type
+  key: stage_3_processing_time_seconds
+
+stage_4_processing_time:
+  type: *metrics_type
+  key: stage_4_processing_time_seconds
+
+stage_5_processing_time:
+  type: *metrics_type
+  key: stage_5_processing_time_seconds
+
+stage_6_processing_time:
+  type: *metrics_type
+  key: stage_6_processing_time_seconds
+
+stage_7_processing_time:
+  type: *metrics_type
+  key: stage_7_processing_time_seconds
+
+stage_8_processing_time:
+  type: *metrics_type
+  key: stage_8_processing_time_seconds
+
+stage_9_processing_time:
+  type: *metrics_type
+  key: stage_9_processing_time_seconds
+
+# 데이터 크기 메트릭
+stage_0_output_count:
+  type: *metrics_type
+  key: stage_0_output_count
+
+stage_1_output_count:
+  type: *metrics_type
+  key: stage_1_output_count
+
+stage_2_output_count:
+  type: *metrics_type
+  key: stage_2_output_count
+
+stage_3_output_count:
+  type: *metrics_type
+  key: stage_3_output_count
+
+stage_4_output_count:
+  type: *metrics_type
+  key: stage_4_output_count
+
+stage_5_output_count:
+  type: *metrics_type
+  key: stage_5_output_count
+
+stage_6_output_count:
+  type: *metrics_type
+  key: stage_6_output_count
+
+stage_7_output_count:
+  type: *metrics_type
+  key: stage_7_output_count
+
+stage_8_output_count:
+  type: *metrics_type
+  key: stage_8_output_count
+
+# 품질 메트릭
+data_quality_duplicate_rows:
+  type: *metrics_type
+  key: data_quality_duplicate_rows
+
+data_quality_null_ratio:
+  type: *metrics_type
+  key: data_quality_null_ratio
+
+class_imbalance_ratio:
+  type: *metrics_type
+  key: class_imbalance_ratio
+
+outlier_removal_ratio:
+  type: *metrics_type
+  key: outlier_removal_ratio
+
+# =============================================================================
+# 체크포인트 (선택적 저장)
+# =============================================================================
+stage_3_checkpoint:
+  type: *artifact_type
+  dataset:
+    type: pandas.ParquetDataset
+    filepath: data/02_intermediate/stage_3_checkpoint.parquet
+    save_args:
+      engine: pyarrow
+
+stage_6_checkpoint:
+  type: *artifact_type
+  dataset:
+    type: pickle.PickleDataset
+    filepath: data/04_feature/stage_6_checkpoint.pkl
+  # {train: df, val: df, test: df}
+
+# =============================================================================
+# 최종 출력 (MLflow artifacts)
+# =============================================================================
+final_data:
+  type: *artifact_type
+  dataset:
+    type: pickle.PickleDataset
+    filepath: data/05_model_input/final_data.pkl
+  # {"train": {...}, "val": {...}, "test": {...}}
+
+final_metadata:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/05_model_input/final_metadata.json
+    save_args:
+      indent: 2
+      ensure_ascii: false
+  # All accumulated metadata
+
+# =============================================================================
+# 영구 저장용 메타데이터 (MLflow artifacts)
+# =============================================================================
+stage_3_label_mapping:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/02_intermediate/stage_3_label_mapping.json
+    save_args:
+      indent: 2
+
+stage_4_company_scaling_stats:
+  type: *artifact_type
+  dataset:
+    type: json.JSONDataset
+    filepath: data/04_feature/stage_4_company_scaling_stats.json
+    save_args:
+      indent: 2
+
+# =============================================================================
+# 파이프라인 파라미터 (MLflow params로 자동 저장)
+# =============================================================================
+# parameters.yml의 설정들이 자동으로 MLflow params로 저장됨
+# kedro-mlflow 플러그인이 자동으로 처리

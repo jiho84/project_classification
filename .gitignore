@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Kedro
+.kedro/
+kedro.db
+.viz/
+mlruns/
+logs/
+
+# Data - exclude ALL data files (large parquet files found!)
+*.parquet
+*.csv
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.feather
+*.arrow
+
+# Data folders - exclude everything
+data/
+*/data/
+backup/data/
+
+# Keep folder structure with .gitkeep files if needed
+!.gitkeep
+
+# Local configuration
+conf/local/
+**/local.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.cache
+
+# Account-tax specific
+account-tax/data/
+account-tax/mlruns/
+account-tax/.viz/
+account-tax/profiling_*.json

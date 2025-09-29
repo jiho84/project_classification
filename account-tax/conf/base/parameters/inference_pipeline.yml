@@ -1,0 +1,5 @@
+# Inference pipeline parameters placeholder
+
+inference:
+  batch_size: 2048
+  output_format: parquet

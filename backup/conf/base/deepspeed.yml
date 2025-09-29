@@ -1,0 +1,161 @@
+# =============================================================================
+# PEFT + DeepSpeed 실험 설정 (YAML 앵커 활용)
+# =============================================================================
+#88f22ca6197a40cabae602b5f005a3f6
+# 실행 ID
+run_id: "20250705_demo"
+
+# ──────────────────────────────
+# ① LoRA 기본값(앵커)
+# ──────────────────────────────
+lora_defaults: &lora_cfg
+  task_type: "SEQ_CLS"
+  r: 256
+  lora_alpha: 512
+  lora_dropout: 0.05
+  target_modules: ["q_proj","k_proj","v_proj","o_proj"]
+  layers_to_transform: [-6,-5,-4, -3, -2, -1]
+  modules_to_save: ["score"]
+  bias: "lora_only"
+
+# ──────────────────────────────
+# ① Learning Rate 정의 (한 곳에서 관리)
+# ──────────────────────────────
+learning_rate: &lr 1e-5
+
+# ──────────────────────────────
+# ② DeepSpeed 공통값(앵커)
+# ──────────────────────────────
+ds_base: &ds_base
+  train_micro_batch_size_per_gpu: 16   # 32→16으로 감소 (메모리 안정성)
+  gradient_accumulation_steps: 2        # 1→2로 증가 (실효 배치 크기 유지: 16×2×4=128)
+  zero_optimization:
+    stage: 2  # ZeRO-2 → ZeRO-3 (기존 체크포인트 호환)
+    offload_param:     
+      device: "none"
+      pin_memory: true
+    offload_optimizer: 
+      device: "cpu"
+      pin_memory: true
+  bf16: 
+    enabled: true
+  activation_checkpointing:
+    partition_activations: true
+    contiguous_memory_optimization: true
+    number_checkpoints: 1
+    cpu_checkpointing: false
+  optimizer:
+    type: "AdamW"
+    params:
+      lr: *lr  # learning_rate 앵커 참조
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      weight_decay: 0.002
+  gradient_clipping: 1.0  # ★ Gradient clipping 추가 (학습 안정성)
+  steps_per_print: 50  # progress_interval과 동기화
+  wall_clock_breakdown: true
+  
+  # DeepSpeed 모니터링 설정
+  monitor_config:
+    enabled: true
+    tensorboard:
+    
+      enabled: true
+      output_path: "./tensorboard_logs"
+    csv_monitor:
+      enabled: true
+      output_path: "./csv_logs"
+      
+  # Flops Profiler 설정
+  flops_profiler:
+    enabled: true
+    profile_step: 1
+    module_depth: 2
+    top_modules: 3
+
+# ──────────────────────────────
+# ③ 스케줄러 프리셋 - 호환성 수정
+# ──────────────────────────────
+sched_warmcos: &sched_warmcos
+  scheduler:
+    type: "WarmupCosineLR"
+    params:
+      total_num_steps: "auto"   # train.py에서 자동 계산하도록 설정
+      warmup_num_steps: "auto"  # 전체 스텝의 10%로 자동 계산
+      warmup_min_ratio: 0.1     # 시작 lr = 1e-6 (기본 lr의 10%)
+      cos_min_ratio: 0.025       # 최종 lr = 1e-7 (기본 lr의 1%)
+      warmup_type: "linear"     # WarmupCosineLR에서도 지원
+
+sched_onecycle: &sched_onecycle
+  scheduler:
+    type: "OneCycle"
+    params:
+      cycle_min_lr: 1.0e-5
+      cycle_max_lr: 3.0e-4
+      cycle_first_step_size: 500
+      cycle_second_step_size: 500
+      decay_lr_rate: 0.05
+
+sched_linear_warmup: &sched_linear_warmup
+  scheduler:
+    type: "WarmupLR"
+    params:
+      warmup_min_lr: "auto"      # learning_rate * 0.1로 자동 계산 (1e-5 → 1e-6)
+      warmup_max_lr: "auto"      # learning_rate로 자동 설정 (1e-5)
+      warmup_num_steps: "auto"   # min(200, total_steps // 10)로 자동 계산
+      warmup_type: "linear"      # 선형 증가 방식
+      
+      # "auto" 값들은 train.py에서 다음과 같이 계산됨:
+      # - warmup_min_lr = learning_rate * 0.1
+      # - warmup_max_lr = learning_rate
+      # - warmup_num_steps = min(200, total_steps // 10)
+
+# ──────────────────────────────
+# ⑤ 실제 사용 섹션
+# ──────────────────────────────
+
+# 모델 설정
+model:
+  name: "Qwen/Qwen3-4B"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+  save_path: "./data/07_model_output/"
+
+# 훈련 설정
+training:
+  epochs: 10
+  seed: 42
+  progress_interval: 50  # 진행률바 업데이트 간격
+  # Warmup 관련 설정
+  warmup_enabled: true   # false→true (스케줄러와 동기화)
+  warmup_steps: "auto"   # 자동 계산
+  warmup_ratio: 0.1      # 전체 훈련 스텝의 10%를 warmup으로 사용
+  # Validation 설정
+  val_check_interval: 0  # 0으로 설정하면 검증 비활성화
+  early_stopping_patience: 0  # 0으로 설정하면 조기 종료 비활성화
+
+# 데이터 설정
+data:                
+  dataset_all_path: "/home/user/projects/my_project/pj_mlflow_ds3/mlruns/708495066330845055/4e16557ede754084b2cb2bcba09d4781/artifacts/final_data.pkl"
+  max_length: 320
+  padding: "max_length"
+  truncation: true
+  extract_ratio: 1.0
+
+# 하드웨어 설정
+hardware:
+  num_workers: 4
+  pin_memory: true
+
+# 캐시 설정
+cache_dir: "./data/06_models/cache"
+
+# LoRA 설정 (앵커 사용)
+lora: *lora_cfg
+
+# DeepSpeed 설정 (앵커 병합)
+deepspeed:
+  <<: *ds_base           # 공통값 병합
+  <<: *sched_warmcos     # ★ WarmupCosine 사용 (강화된 warmup)
+  #<<: *sched_onecycle   # ↑ 필요하면 이 줄로 교체
+  #<<: *sched_linear_warmup  # ↑ 단순 Linear Warmup 사용 시

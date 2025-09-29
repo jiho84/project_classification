@@ -1,0 +1,59 @@
+# 🔍 추론 설정 파일 (앵커 방식 개선된 버전)
+# 모델 경로와 데이터 경로를 직접 입력하여 추론 실행
+
+# 🎯 공통 설정 정의 (앵커)
+defaults: &defaults
+  # 📊 입력 데이터 경로
+  data:
+    input_path: &default_data_path "data/09_inference_input/test.parquet"
+    
+  # 🎯 모델 경로  
+  model:
+    checkpoint_path: &default_checkpoint_path "/home/user/projects/my_project/pj_mlflow_ds3/mlruns/472248896223754014/a676b9727b3b433d8507ad2140b430f9/artifacts/checkpoints/epoch_04"
+    checkpoint_type: &default_checkpoint_type "deepspeed"
+    
+  # 📊 메타데이터 경로 (필요시 추가)
+    
+  # 📁 출력 경로
+  output:
+    result_dir: &default_output_dir "./data/09_inference_output"
+
+  
+# 📊 실제 설정 (기본 단일GPU 설정)
+data:
+  input_path: *default_data_path
+  
+model:
+  checkpoint_path: *default_checkpoint_path
+  checkpoint_type: *default_checkpoint_type
+  use_lora: true
+  
+# metadata 섹션 제거 (사용하지 않음)
+  
+output:
+  result_dir: *default_output_dir
+  
+# ⚙️ 추론 설정
+inference:
+  batch_size: 128        # 추론 배치 크기. CLI --batch-size 로 오버라이드 가능.
+  max_samples: null       # 최대 처리 샘플 수 (null=전체, 숫자=제한)
+  max_length: 256      # 토크나이저 최대 길이
+  confidence_mode: "max"  # confidence 계산 방식: "max"=최대값, "sampled"=확률분포 샘플링
+
+# 🔧 전처리 설정 (메타데이터 기반 자동 처리)
+preprocessing:
+  save_preprocessed_sample: true  # 전처리된 데이터 샘플 저장 여부
+  sample_size: null  # 저장할 샘플 크기 (null=전체)
+  
+# 🖥️ GPU 설정
+gpu:
+  gpu_id: 0  # CLI --gpu-id 로 오버라이드 가능
+  deepspeed_inference: true
+
+# 🔧 DeepSpeed 추론 설정
+deepspeed:
+  replace_with_kernel_inject: false
+  dtype: "bfloat16"
+  max_out_tokens: 1
+  replace_method: "auto"
+

@@ -1,0 +1,62 @@
+# Ingestion, Preprocess, and Feature pipeline parameters
+
+ingestion:
+  metadata:
+    extract_stats: true
+    include_dtypes: true
+
+preprocess:
+  clean:
+    remove_duplicates: true
+    dropna_columns:
+      - party_vat_id
+  filter:
+    exclude_columns:
+      - id
+      - created_at
+      - batch_no
+  code_mappings: {}
+  missing_values:
+    categorical: "__missing__"
+    numeric: 0
+    datetime: "1970-01-01"
+    boolean: false
+    strip_whitespace: true
+
+feature:
+  engineering:
+    date_column: "date"
+    add_holiday: true
+  selection:
+    enabled: true
+    features:
+      - date
+      - vat_type
+      - party_name
+      - company_name
+      - company_vat_id
+      - item
+      - supply_amount
+      - vat_amount
+      - total_amount
+      - in_multi
+      - document_channel
+      - document_type
+      - service_charge
+      - party_type_code
+      - party_vat_id
+      - counterparty_card_number
+      - transaction_code
+      - business_type
+      - business_item
+      - vat_message_code
+      - close_date
+      - product
+      - company_business_type
+      - company_business_item
+      - company_vat_message_code
+    label: acct_code
+  dataset_conversion:
+    label_column: acct_code
+    max_classes: 1000
+    dummy_prefix: dummy

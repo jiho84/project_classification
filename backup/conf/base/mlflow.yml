@@ -1,0 +1,29 @@
+# MLflow configuration for kedro-mlflow plugin
+# ===========================================
+
+# MLflow server configuration
+server:
+  mlflow_tracking_uri: "./mlruns"  # Use local directory
+  mlflow_registry_uri: null
+
+# Experiment tracking configuration
+tracking:
+  # Configure how parameters are handled
+  params:
+    long_params_strategy: "truncate"  # "fail", "truncate", or "tag"
+    
+  # Experiment settings
+  experiment:
+    name: "Accounting_Classification_MLOps_Kedro"
+    restore_if_deleted: true
+    
+  # Run settings
+  run:
+    name: null  # Will be auto-generated
+    id: null    # Will be auto-generated
+    nested: false
+
+# UI configuration
+ui:
+  port: "5000"
+  host: "127.0.0.1"

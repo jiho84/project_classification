@@ -1,0 +1,23 @@
+# Split and Train pipeline parameters
+
+split:
+  label_column: acct_code
+  seed: 42
+  test_size: 0.2
+  val_size: 0.1
+  dummy_label: dummy1
+
+train:
+  serialization:
+    text_columns: []
+    separator: ", "
+    include_column_names: true
+  tokenization:
+    model_name: "Qwen/Qwen2.5-0.5B"
+    max_length: 512
+    truncation: true
+    num_proc: 4
+    diagnostics:
+      sample_size: 5
+      percentiles: [50, 75, 90, 95, 99]
+      seed: 42

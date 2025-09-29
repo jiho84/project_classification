@@ -1,0 +1,41 @@
+ipykernel v6.30.1
+├── appnope v0.1.4
+├── comm v0.2.3
+├── debugpy v1.8.16
+├── ipython v9.5.0
+│   ├── decorator v5.2.1
+│   ├── ipython-pygments-lexers v1.1.1
+│   │   └── pygments v2.19.2
+│   ├── jedi v0.19.2
+│   │   └── parso v0.8.5
+│   ├── matplotlib-inline v0.1.7
+│   │   └── traitlets v5.14.3
+│   ├── pexpect v4.9.0
+│   │   └── ptyprocess v0.7.0
+│   ├── prompt-toolkit v3.0.52
+│   │   └── wcwidth v0.2.13
+│   ├── pygments v2.19.2
+│   ├── stack-data v0.6.3
+│   │   ├── asttokens v3.0.0
+│   │   ├── executing v2.2.1
+│   │   └── pure-eval v0.2.3
+│   └── traitlets v5.14.3
+├── jupyter-client v8.6.3
+│   ├── jupyter-core v5.8.1
+│   │   ├── platformdirs v4.4.0
+│   │   └── traitlets v5.14.3
+│   ├── python-dateutil v2.9.0.post0
+│   │   └── six v1.17.0
+│   ├── pyzmq v27.1.0
+│   ├── tornado v6.5.2
+│   └── traitlets v5.14.3
+├── jupyter-core v5.8.1 (*)
+├── matplotlib-inline v0.1.7 (*)
+├── nest-asyncio v1.6.0
+├── packaging v25.0
+├── psutil v7.0.0
+├── pyzmq v27.1.0
+├── tornado v6.5.2
+└── traitlets v5.14.3
+pip v25.2
+(*) Package tree already displayed

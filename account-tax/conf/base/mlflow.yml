@@ -1,0 +1,13 @@
+server:
+  mlflow_tracking_uri: mlruns
+tracking:
+  experiment:
+    name: "account_tax_experiment"
+  run:
+    name: "${km.random_name:}"
+    nested: false
+  params:
+    dict_params:
+      flatten: true
+      recursive: true
+      sep: "."
