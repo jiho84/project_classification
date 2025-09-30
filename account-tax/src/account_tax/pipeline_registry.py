@@ -45,11 +45,25 @@ def register_pipelines() -> dict[str, Pipeline]:
         train_pipeline
     )
 
+    # Data pipeline (only data preparation, no split)
+    data_pipeline = data_prep_pipeline  # ingestion + preprocess + feature
+
+    # Training pipeline (split + train)
+    training_pipeline = split_pipeline + train_pipeline
+
+    # End-to-end pipeline (data + training)
+    e2e_pipeline = data_pipeline + training_pipeline
+
     return {
-        "__default__": full_preprocess,
+        "__default__": data_pipeline,
+        "data": data_pipeline,
+        "training": training_pipeline,
+        "e2e": e2e_pipeline,
+        # Legacy names for backward compatibility
         "full_preprocess": full_preprocess,
         "full": full_pipeline,
         "data_prep": data_prep_pipeline,
+        # Individual pipelines
         "ingestion": ingestion_pipeline,
         "preprocess": preprocess_pipeline,
         "feature": feature_pipeline,

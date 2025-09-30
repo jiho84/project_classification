@@ -1,0 +1,126 @@
+# Split and Train pipeline parameters
+
+split:
+  label_column: acct_code
+  seed: 42
+  test_size: 0.2
+  val_size: 0.1
+  max_classes: 1000
+  dummy_prefix: dummy
+  dummy_label: dummy1
+  labelize_num_proc: 4
+
+train:
+  serialization:
+    text_columns: []
+    separator: ", "
+    include_column_names: true
+    num_proc: 4
+    retain_columns:
+      - text
+      - labels
+      - acct_code
+    label_column: acct_code
+
+  tokenization:
+    model_name: "Qwen/Qwen3-4B"
+    max_length: 512
+    truncation: true
+    padding: false  # Dynamic padding in collator
+    num_proc: 4
+    diagnostics:
+      sample_size: 5
+      percentiles: [50, 75, 90, 95, 99]
+      seed: 42
+
+  model:
+    name: "Qwen/Qwen3-4B"
+    num_labels: null  # Will be inferred from data
+    problem_type: "single_label_classification"
+    trust_remote_code: true
+    torch_dtype: "bfloat16"  # Use bfloat16 for better performance
+    device_map: "auto"  # Automatic device mapping
+    low_cpu_mem_usage: true
+
+  trainer:
+    output_dir: "./checkpoints"
+    overwrite_output_dir: true
+    num_train_epochs: 3
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 16
+    gradient_accumulation_steps: 4
+    gradient_checkpointing: true
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+    logging_steps: 10
+    save_strategy: "epoch"
+    save_total_limit: 2
+    evaluation_strategy: "epoch"
+    eval_steps: null  # Evaluate at end of each epoch
+    metric_for_best_model: "eval_loss"
+    greater_is_better: false
+    load_best_model_at_end: true
+    push_to_hub: false
+    report_to: ["mlflow"]
+    fp16: false  # Use bf16 instead
+    bf16: true
+    dataloader_num_workers: 4
+    remove_unused_columns: true
+    label_smoothing_factor: 0.0
+    optim: "adamw_torch"
+    seed: 42
+
+  deepspeed:
+    enable: false  # Set to true to enable DeepSpeed
+    config:
+      zero_optimization:
+        stage: 2
+        offload_optimizer:
+          device: "cpu"
+          pin_memory: true
+        offload_param:
+          device: "cpu"
+          pin_memory: true
+        overlap_comm: true
+        contiguous_gradients: true
+        sub_group_size: 1e9
+        reduce_bucket_size: "auto"
+        stage3_prefetch_bucket_size: "auto"
+        stage3_param_persistence_threshold: "auto"
+        stage3_max_live_parameters: 1e9
+        stage3_max_reuse_distance: 1e9
+        stage3_gather_16bit_weights_on_model_save: true
+      fp16:
+        enabled: false
+      bf16:
+        enabled: true
+      gradient_accumulation_steps: 4
+      gradient_clipping: 1.0
+      steps_per_print: 10
+      train_batch_size: "auto"
+      train_micro_batch_size_per_gpu: "auto"
+      wall_clock_breakdown: false
+
+  evaluation:
+    compute_metrics: true
+    metric_names: ["accuracy", "f1", "precision", "recall"]
+    average: "weighted"  # For multi-class metrics
+    save_predictions: true
+    save_confusion_matrix: true
+
+  optimization:
+    compile_model: false  # torch.compile (requires PyTorch 2.0+)
+    use_lora: false  # Enable LoRA for parameter-efficient training
+    lora_config:
+      r: 16
+      lora_alpha: 32
+      lora_dropout: 0.1
+      target_modules: ["q_proj", "v_proj"]
+
+  logging:
+    log_level: "info"
+    log_on_each_node: false
+    logging_first_step: true
+    logging_nan_inf_filter: true
+    save_safetensors: true

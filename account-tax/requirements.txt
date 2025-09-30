@@ -9,3 +9,13 @@ mlflow-skinny>=2.22,<3.0
 datasets>=3.0.0,<3.1.0
 kedro-mlflow>=1.0.0,<1.1.0
 holidays>=0.81
+
+# HuggingFace dependencies for NLP
+transformers>=4.44.0  # For Qwen3 support (released June 2024)
+torch>=2.0.0  # For torch.compile support
+accelerate>=0.25.0  # For model parallelism and optimization
+peft>=0.7.0  # For LoRA and parameter-efficient fine-tuning
+deepspeed>=0.12.0  # For distributed training optimization
+safetensors>=0.4.0  # For safe model serialization
+sentencepiece>=0.1.99  # Some models require this tokenizer
+protobuf>=3.20.0  # Required by some tokenizers

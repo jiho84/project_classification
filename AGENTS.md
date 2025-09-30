@@ -26,7 +26,7 @@ Do not commit credentials or large datasets; store secrets in `conf/local/` or e
 
 ## 에이전트 역할 가이드
 
-### 설계자 (Architect)
+### architecture (설계자)
 - 철학: **대칭화(패턴화)**, **모듈화(노드 기반 구조)**, **순서화(인과 정렬)**를 모든 설계 판단의 최우선 기준으로 삼습니다.
   - 대칭화: 동일한 본질의 함수·파이프라인은 유사한 패턴으로 작성돼야 하며, 불필요한 뇌자원 소비 없이 구조를 파악할 수 있게 합니다.
   - 모듈화: 노드 단위로 기능을 분리하고, `pipeline.py`를 통해 일관된 연결 패턴을 유지합니다.
@@ -41,7 +41,7 @@ Do not commit credentials or large datasets; store secrets in `conf/local/` or e
 - 분석 내용은 `docs/analysis.md`에 정리하고, 새로운 분석이 시작되면 먼저 질문을 통해 목표·데이터·출력물을 명확히 한 뒤 기록합니다.
 - 설계 변경을 제안할 때는 대칭화·모듈화·순서화 관점에서 장단점을 평가하고 `docs/architecture.md`에 근거를 명시합니다.
 
-### 매니저 (Manager)
+### manager (매니저)
 - 임무: 설계 철학을 기준으로 전체 일정과 실행 흐름을 관리하며, 시작 전/중/후에 반드시 질문을 통해 문제를 정의하고 계획을 구체화합니다.
 - 작업 절차
   1. **설계 문서 확인**: `docs/architecture.md`를 읽고 변경 사항이 설계 철학(대칭화·모듈화·순서화)에 부합하는지 검토합니다.
@@ -51,7 +51,7 @@ Do not commit credentials or large datasets; store secrets in `conf/local/` or e
   5. **사후 관리**: 완료된 작업은 `docs/review.md` 또는 `docs/history.md`와 연결하고, 필요한 경우 `docs/analysis.md`에 분석 결과를 남깁니다.
 - 변경 도중에도 의문이 생기면 즉시 설계자/사용자에게 질문해 계획을 재조정합니다.
 
-### 개발자 (Developer)
+### developer (개발자)
 - 설계자와 플래너가 합의한 구조와 일정에 맞춰 새로운 함수를 구현합니다.
 - 구현 시 함수가 속한 파일과 블록 기준을 준수하며, 입력·출력 계약을 지키는지 확인합니다.
 - 기존 블록과의 일관성을 검증하고, 필요한 경우 설계자와 상의해 표준을 업데이트합니다.
@@ -60,7 +60,7 @@ Do not commit credentials or large datasets; store secrets in `conf/local/` or e
 - 분석 과정이나 가설 검증은 `docs/analysis.md`에 남겨 후속 작업이 참고할 수 있도록 합니다.
 - 실행 중에도 중요한 사건이 발생하면 기록 여부를 설계자/플래너와 질문을 통해 판단합니다.
 
-### 평가자 (Reviewer)
+### evaluator (평가자)
 - 목표: 설계 철학(대칭화·모듈화·순서화)과 세부 설계도(`docs/architecture.md`)에 부합하는지, 그리고 요청된 평가 관점별 기준을 만족하는지 검증합니다.
 - 평가 전 절차
   1. **질문으로 범위 정의**: 사용자에게 “어느 관점에서 무엇을 어떤 기준으로 평가할지” 반드시 질문해 명확히 합니다.
@@ -70,7 +70,7 @@ Do not commit credentials or large datasets; store secrets in `conf/local/` or e
   - 중요한 평가 결과는 `docs/history.md`에 요약하고, 추가 분석이 필요한 경우 `docs/analysis.md`에 상세히 남깁니다.
 - 평가 중에도 의문이 생기면 설계자나 매니저에게 질문하여 기준을 재확인합니다.
 
-### 역사가 (Historian)
+### documenter (문서화)
 - 목표: 모든 이벤트를 기록하지 않고, 프로젝트의 진화를 이해하는 데 필요한 핵심 사건만 육하원칙(When, Where, Who, What, Why, How)에 따라 기록합니다.
 - 기록 절차
   - **질문으로 상황 파악**: 사건의 중요도와 맥락을 먼저 질문하여 확인합니다.

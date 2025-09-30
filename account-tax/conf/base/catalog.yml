@@ -2,7 +2,7 @@
 
 raw_account_data:
   type: kedro_datasets.pandas.ParquetDataset
-  filepath: data/01_raw/row_data.parquet
+  filepath: data/01_raw/dataset.parquet
   load_args:
     engine: pyarrow
   save_args:
@@ -88,3 +88,88 @@ token_length_report:
 
 tokenized_datasets:
   type: MemoryDataset
+
+# Training pipeline outputs
+tokenization_metadata:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/tokenization_metadata.json
+    save_args:
+      indent: 2
+  artifact_path: metadata/tokenization
+
+base_model:
+  type: MemoryDataset
+
+model_metadata:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/model_metadata.json
+    save_args:
+      indent: 2
+  artifact_path: metadata/model
+
+optimized_model:
+  type: MemoryDataset
+
+optimization_metadata:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/optimization_metadata.json
+    save_args:
+      indent: 2
+  artifact_path: metadata/optimization
+
+trainer_components:
+  type: MemoryDataset
+
+trainer_metadata:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/trainer_metadata.json
+    save_args:
+      indent: 2
+  artifact_path: metadata/trainer
+
+trained_model:
+  type: MemoryDataset
+
+training_metrics:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/training_metrics.json
+    save_args:
+      indent: 2
+  artifact_path: metrics/training
+
+training_artifacts:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/training_artifacts.json
+    save_args:
+      indent: 2
+  artifact_path: artifacts/training
+
+evaluation_metrics:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/evaluation_metrics.json
+    save_args:
+      indent: 2
+  artifact_path: metrics/evaluation
+
+evaluation_artifacts:
+  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
+  dataset:
+    type: kedro_datasets.json.JSONDataset
+    filepath: data/08_reporting/evaluation_artifacts.json
+    save_args:
+      indent: 2
+  artifact_path: artifacts/evaluation

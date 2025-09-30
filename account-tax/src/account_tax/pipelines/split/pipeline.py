@@ -63,19 +63,8 @@ def create_pipeline(**kwargs) -> Pipeline:
             tags="split",
         ),
         node(
-            func=analyze_token_lengths,
-            inputs=[
-                "text_datasets",
-                "params:train.tokenization",
-                "params:train.tokenization.diagnostics",
-            ],
-            outputs=["text_datasets_with_stats", "token_length_report"],
-            name="analyze_token_lengths",
-            tags="split",
-        ),
-        node(
             func=export_text_partitions,
-            inputs="text_datasets_with_stats",
+            inputs="text_datasets",
             outputs="text_datasets_mlflow",
             name="export_text_partitions",
             tags="split",
