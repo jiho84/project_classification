@@ -1,114 +1,330 @@
-# Notebook Usage Guide
+# Jupyter Notebook Data Loading Tutorial
 
-Follow this checklist whenever you want to explore pipeline outputs inside Jupyter.
+주피터 노트북에서 `account-tax` 파이프라인의 데이터를 로드하고 탐색하는 방법을 안내합니다.
 
-## 1. Launch Jupyter from the Kedro project
+## 초기 설정
 
-```bash
-cd /home/user/projects/kedro_project/account-tax
-kedro jupyter notebook  # or: jupyter lab
-```
-
-> Always start Jupyter inside the project root so the Kedro settings and catalog are discovered automatically.
-
-Open `notebooks/explore_project.ipynb` (or create a new notebook in the same folder).
-
-## 2. Import Kedro helpers in a notebook cell
+### 1. 기본 라이브러리 임포트
 
 ```python
-from load_intermediate_outputs import (
-    get_catalog,
-    load_prepared_datasets,
-    load_text_datasets,
-    summarise_dataframe,
+# 데이터 처리
+import pandas as pd
+import numpy as np
+
+# 데이터 로드
+import pickle
+import json
+from pathlib import Path
+
+# Kedro 통합
+from kedro.framework.startup import bootstrap_project
+from kedro.framework.session import KedroSession
+
+# 시각화
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# HuggingFace datasets
+from datasets import Dataset, DatasetDict
+
+# 화면 표시 설정
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', 100)
+pd.set_option('display.width', None)
+```
+
+## Method 1: Kedro Catalog을 통한 로드 (권장)
+
+Kedro의 DataCatalog를 사용하면 모든 데이터셋 타입을 자동으로 처리합니다.
+
+```python
+# 프로젝트 부트스트랩
+project_path = Path.cwd().parent  # notebooks/에서 실행 시
+bootstrap_project(project_path)
+
+# Kedro 세션 생성
+with KedroSession.create(project_path=project_path) as session:
+    context = session.load_context()
+    catalog = context.catalog
+
+    # 데이터셋 로드
+    raw_data = catalog.load("raw_account_data")  # Parquet
+    standardized_data = catalog.load("standardized_data")  # Parquet
+    validated_data = catalog.load("validated_data")  # Parquet
+    base_table = catalog.load("base_table")  # Parquet (features 포함)
+```
+
+### Catalog에서 사용 가능한 데이터셋
+
+| 데이터셋 이름 | 타입 | 위치 | 설명 |
+|--------------|------|----------|-------------|
+| `raw_account_data` | Parquet | `data/01_raw/dataset.parquet` | 원본 입력 데이터 |
+| `standardized_data` | Parquet | `data/02_intermediate/standardized_data.parquet` | Ingestion 후 |
+| `validated_data` | Parquet | `data/03_primary/validated_data.parquet` | Preprocess 후 |
+| `base_table` | Parquet | `data/04_feature/base_table.parquet` | Feature engineering 완료 |
+| `serialized_datasets` | Pickle | `data/05_model_input/serialized_datasets.pkl` | Text + labels (HF Dataset) |
+| `token_length_report` | JSON | `data/08_reporting/token_length_report.json` | 토크나이징 통계 |
+
+## Method 2: 파일 직접 로드
+
+### Parquet 파일 로드
+
+```python
+import pandas as pd
+
+# Parquet 파일 로드
+df = pd.read_parquet('data/01_raw/dataset.parquet')
+
+# 특정 엔진 지정
+df = pd.read_parquet(
+    'data/04_feature/base_table.parquet',
+    engine='pyarrow'
 )
+
+# 빠른 점검
+print(f"Shape: {df.shape}")
+print(f"Columns: {df.columns.tolist()}")
+print(f"Memory: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+df.head()
 ```
 
-These helpers live in `notebooks/load_intermediate_outputs.py` and wrap the Kedro session/ catalog boilerplate for you.
+### Pickle 파일 로드 (HuggingFace DatasetDict)
 
-## 3. Materialise split outputs for analysis
+Pickle 파일은 종종 복잡한 중첩 구조를 포함합니다. 탐색 및 추출 방법:
 
 ```python
-prepared = load_prepared_datasets()  # returns {"train": DataFrame, "valid": ..., "test": ...}
-textual = load_text_datasets()
+import pickle
 
-# 어떤 split이 준비됐는지 확인
-list(prepared.keys())      # ['train', 'valid', 'test']
-prepared.keys()            # dict_keys([...]) 그대로 보고 싶다면
+# Pickle 파일 로드
+with open('data/05_model_input/serialized_datasets.pkl', 'rb') as f:
+    data = pickle.load(f)
+
+# 1단계: 타입 확인
+print(f"Type: {type(data)}")
+print(f"Object: {data}")
+
+# 2단계: 구조 탐색 (키 트리)
+def explore_dict_structure(obj, indent=0):
+    """딕셔너리 구조를 재귀적으로 탐색합니다."""
+    prefix = "  " * indent
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            print(f"{prefix}{key}: {type(value).__name__}")
+            if isinstance(value, (dict, list)):
+                explore_dict_structure(value, indent + 1)
+    elif isinstance(obj, list) and len(obj) > 0:
+        print(f"{prefix}[0]: {type(obj[0]).__name__}")
+        if isinstance(obj[0], (dict, list)):
+            explore_dict_structure(obj[0], indent + 1)
+
+explore_dict_structure(data)
 ```
 
-Each value is a pandas `DataFrame`. If you need the raw lazy loaders instead (for custom IO), pass `materialize=False` to either function.
+**serialized_datasets.pkl 예시 출력:**
+```
+<class 'datasets.dataset_dict.DatasetDict'>
+DatasetDict({
+    train: Dataset({
+        features: ['text', 'labels'],
+        num_rows: 2538448
+    })
+    valid: Dataset({
+        features: ['text', 'labels'],
+        num_rows: 317306
+    })
+    test: Dataset({
+        features: ['text', 'labels'],
+        num_rows: 317307
+    })
+})
+```
 
-## 4. Quick sanity checks
+### 3단계: HuggingFace Dataset에서 DataFrame 추출
 
 ```python
-summarise_dataframe(prepared["train"])
-prepared["train"].head()
-prepared["train"].describe(include="all")
-prepared["train"].sample(5, random_state=42)
+# 방법 A: 전체 split을 pandas로 변환
+train_df = data['train'].to_pandas()
+valid_df = data['valid'].to_pandas()
+test_df = data['test'].to_pandas()
 
-# split별 크기 비교
-{split: df.shape for split, df in prepared.items()}
+# 방법 B: 특정 컬럼 접근
+texts = data['train']['text']
+labels = data['train']['labels']
 
-# 특정 라벨 분포 확인
-prepared["train"].value_counts("labels").head()
+# 방법 C: 샘플 인덱스 선택
+sample = data['train'].select(range(10))  # 처음 10개 샘플
+sample_df = sample.to_pandas()
+
+# 방법 D: 데이터 필터링
+filtered = data['train'].filter(lambda x: x['labels'] == 5)
+filtered_df = filtered.to_pandas()
 ```
 
-`prepared` keeps all original numerical/categorical columns plus `labels` and `split`. `textual` narrows the columns to `acct_code`, `labels`, `text`, `split` so you can feed it directly to tokenisers.
-
-### Mini tutorial: 탐색 패턴 모음
-
-1. **칼럼 목록 살펴보기**
-   ```python
-   prepared["train"].columns.tolist()
-   textual["train"].columns
-   ```
-2. **결측치 요약**
-   ```python
-   prepared["train"].isna().mean().sort_values(ascending=False).head(10)
-   ```
-3. **숫자형 분포 시각화(간단)**
-   ```python
-   prepared["train"].hist(column=["supply_amount", "vat_amount"], bins=30, figsize=(10, 4))
-   ```
-4. **텍스트 샘플 미리보기**
-   ```python
-   textual["train"].loc[::5000, ["labels", "text"]].head()
-   ```
-5. **카테고리별 그룹 통계**
-   ```python
-   prepared["train"].groupby("labels")["total_amount"].agg(["count", "mean"]).sort_values("count", ascending=False).head(10)
-   ```
-6. **딕셔너리 전체 구조 탐색**
-   ```python
-   def print_dict_structure(mapping, indent=0):
-       prefix = " " * indent
-       if isinstance(mapping, dict):
-           for key, value in mapping.items():
-               print(f"{prefix}- {key}: {type(value).__name__}")
-               print_dict_structure(value, indent + 2)
-       else:
-           # 비딕셔너리 최하위 값에 도달하면 종료
-           return
-
-   print_dict_structure(prepared)
-   ```
-   DataFrame과 같이 딕셔너리가 아닌 값에 도달하면 거기서 멈추므로, 중첩된 구조를 한 번에 훑어볼 때 유용합니다. 필요에 따라 `textual`이나 다른 catalog 결과에도 동일하게 적용할 수 있습니다.
-
-필요한 탐색을 마친 후에는 중요한 통찰을 `docs/analysis.md`에 간략히 정리하고, 참고용으로 관련 노트북 셀 번호나 마크다운 링크를 남겨 두세요.
-
-## 5. Load additional datasets on demand
-
-If you need another catalog entry, open a temporary catalog via `get_catalog()` and call `catalog.load("dataset_name")`. Remember to close the session when you are done:
+### JSON 리포트 로드
 
 ```python
-catalog = get_catalog()
-try:
-    base = catalog.load("base_table")
-finally:
-    catalog._session.close()
+import json
+
+# Token length report 로드
+with open('data/08_reporting/token_length_report.json', 'r') as f:
+    report = json.load(f)
+
+# 예쁘게 출력
+import pprint
+pprint.pprint(report)
+
+# 특정 통계 접근
+print(f"Overall mean token length: {report['overall']['mean']}")
+print(f"Train split stats: {report['per_split']['train']}")
 ```
 
-## 6. Keep analyses in sync with docs
+## 일반적인 데이터 탐색 작업
 
-When you discover insights, record the highlights in `docs/analysis.md` and link back to the notebook cell or file for future reference.
+### 1. 기본 통계
+
+```python
+# pandas DataFrame용
+df.info()
+df.describe()
+df.dtypes
+df.isnull().sum()
+
+# HuggingFace Dataset용
+dataset = data['train']
+print(f"Num rows: {len(dataset)}")
+print(f"Columns: {dataset.column_names}")
+print(f"Features: {dataset.features}")
+```
+
+### 2. 라벨 분포
+
+```python
+# pandas DataFrame에서
+label_counts = df['label_column'].value_counts()
+print(label_counts)
+
+# HuggingFace Dataset에서
+from collections import Counter
+labels = data['train']['labels']
+label_dist = Counter(labels)
+print(label_dist.most_common(10))
+
+# 시각화
+pd.Series(label_dist).plot(kind='bar', figsize=(12, 6))
+plt.title('Label Distribution')
+plt.xlabel('Label')
+plt.ylabel('Count')
+plt.tight_layout()
+plt.show()
+```
+
+### 3. 무작위 샘플링
+
+```python
+# pandas DataFrame에서
+sample_df = df.sample(n=10, random_state=42)
+
+# HuggingFace Dataset에서
+import random
+random.seed(42)
+indices = random.sample(range(len(data['train'])), k=10)
+samples = data['train'].select(indices)
+
+# 샘플 표시 (생략 없이 전체 출력)
+for i, sample in enumerate(samples):
+    print(f"\n{'='*80}")
+    print(f"Sample {i+1}")
+    print(f"{'='*80}")
+    print(f"Text: {sample['text']}")  # 전체 텍스트 출력
+    print(f"Label: {sample['labels']}")
+```
+
+## 완전한 워크플로우 예시
+
+```python
+# 1. Kedro를 통한 데이터 로드
+from kedro.framework.startup import bootstrap_project
+from kedro.framework.session import KedroSession
+from pathlib import Path
+
+project_path = Path.cwd().parent
+bootstrap_project(project_path)
+
+with KedroSession.create(project_path=project_path) as session:
+    catalog = session.load_context().catalog
+    base_table = catalog.load("base_table")
+
+# 2. 기본 탐색
+print(f"Shape: {base_table.shape}")
+print(f"Columns: {base_table.columns.tolist()}")
+
+# 3. Pickle 데이터셋 로드
+import pickle
+with open('../data/05_model_input/serialized_datasets.pkl', 'rb') as f:
+    datasets = pickle.load(f)
+
+# 4. 구조 탐색
+def show_dataset_info(dataset_dict):
+    for split_name, dataset in dataset_dict.items():
+        print(f"\n{split_name}:")
+        print(f"  Rows: {len(dataset)}")
+        print(f"  Columns: {dataset.column_names}")
+        print(f"  Sample: {dataset[0]}")
+
+show_dataset_info(datasets)
+
+# 5. pandas로 변환하여 분석
+train_df = datasets['train'].to_pandas()
+
+# 6. 시각화
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+# 라벨 분포
+train_df['labels'].value_counts().plot(kind='bar', ax=axes[0])
+axes[0].set_title('Label Distribution')
+axes[0].set_xlabel('Label')
+axes[0].set_ylabel('Count')
+
+# 텍스트 길이 분포
+text_lengths = train_df['text'].str.len()
+axes[1].hist(text_lengths, bins=50, edgecolor='black')
+axes[1].set_title('Text Length Distribution')
+axes[1].set_xlabel('Character Count')
+axes[1].set_ylabel('Frequency')
+
+plt.tight_layout()
+plt.show()
+```
+
+## 팁과 모범 사례
+
+1. **메모리 관리**: HuggingFace Datasets는 메모리 매핑을 사용하므로 대용량 파일도 효율적입니다. `.to_pandas()`는 작은 서브셋에만 사용하세요.
+
+2. **지연 로딩**: Dataset은 지연 로딩됩니다. pandas로 변환하기 전에 `.select()` 또는 `.filter()`를 사용하여 메모리 사용량을 줄이세요.
+
+3. **병렬 처리**: 대용량 parquet 파일 로드 시 `engine='pyarrow'`를 사용하면 성능이 향상됩니다.
+
+4. **캐싱**: Kedro는 세션 동안 로드된 데이터셋을 캐싱하므로 반복된 `catalog.load()` 호출은 빠릅니다.
+
+5. **Pickle 파일 탐색**: DataFrame을 추출하기 전에 항상 `explore_dict_structure()`를 사용하여 중첩된 데이터를 이해하세요.
+
+## 문제 해결
+
+**문제**: 데이터 로드 시 `FileNotFoundError`
+- **해결**: 해당 파이프라인 스테이지를 먼저 실행했는지 확인 (`kedro run --pipeline=<stage>`)
+
+**문제**: Pickle 파일에 예상치 못한 구조 포함
+- **해결**: `explore_dict_structure()`를 사용하여 전체 키 트리 검사
+
+**문제**: 대용량 Dataset을 pandas로 변환 시 `MemoryError`
+- **해결**: `.select(range(n))`으로 먼저 샘플링하거나 청크 단위로 처리
+
+## 추가 참고 자료
+
+- [Kedro Data Catalog Documentation](https://docs.kedro.org/en/stable/data/data_catalog.html)
+- [HuggingFace Datasets Documentation](https://huggingface.co/docs/datasets/)
+- [Pandas User Guide](https://pandas.pydata.org/docs/user_guide/index.html)

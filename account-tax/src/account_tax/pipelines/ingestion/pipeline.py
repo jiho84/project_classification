@@ -3,7 +3,9 @@
 from kedro.pipeline import Pipeline, node
 from .nodes import (
     load_data,
+    collect_missing_stats,
     standardize_columns,
+    transform_dtype,
     extract_metadata
 )
 
@@ -24,10 +26,24 @@ def create_pipeline(**kwargs) -> Pipeline:
                 tags="ingestion",
             ),
             node(
+                func=collect_missing_stats,
+                inputs="validated_raw_data",
+                outputs="raw_missing_stats",
+                name="collect_raw_missing_stats",
+                tags="ingestion",
+            ),
+            node(
                 func=standardize_columns,
                 inputs="validated_raw_data",
-                outputs="standardized_data",
+                outputs="standardized_data_raw",
                 name="standardize_columns",
+                tags="ingestion",
+            ),
+            node(
+                func=transform_dtype,
+                inputs="standardized_data_raw",
+                outputs="standardized_data",
+                name="transform_dtype",
                 tags="ingestion",
             ),
             node(

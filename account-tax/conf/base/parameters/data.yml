@@ -9,15 +9,22 @@ preprocess:
   clean:
     remove_duplicates: true
     dropna_columns:
-      - party_vat_id
+      - vat_id_party
+      - date
+      - total_amount
+      - acct_code
+      - year
   filter:
-    exclude_columns:
-      - id
-      - created_at
-      - batch_no
+    exclude_columns: [id, created_at, batch_no, name]
+    keep_rows:
+      - column: year
+        values: ["2020", "2021", "2022", "2023", "2024"]
+    drop_rows:
+      - column: vat_type
+        values: ["17","18","19"]
   code_mappings: {}
   missing_values:
-    categorical: "__missing__"
+    categorical: "<NA>"
     numeric: 0
     datetime: "1970-01-01"
     boolean: false
@@ -29,32 +36,30 @@ feature:
     add_holiday: true
   selection:
     enabled: true
-    features:
+    features: 
       - date
-      - vat_type
-      - party_name
+      - close_date
       - company_name
-      - company_vat_id
-      - item
-      - supply_amount
-      - vat_amount
-      - total_amount
-      - in_multi
-      - document_channel
-      - document_type
-      - service_charge
-      - party_type_code
-      - party_vat_id
-      - counterparty_card_number
-      - transaction_code
+      - vat_id_company
+      - company_business_type
+      - company_business_item
+      - vat_message_code_company
+      - party_name
+      - party_type
+      - vat_id_party
       - business_type
       - business_item
       - vat_message_code
-      - close_date
-      - product
-      - company_business_type
-      - company_business_item
-      - company_vat_message_code
+      - transaction_type
+      - document_type
+      - is_multi
+      - is_electronic
+      - service_charge
+      - card_number
+      - supply_amount
+      - vat_amount
+      - total_amount
+      - item
     label: acct_code
   dataset_conversion:
     label_column: acct_code

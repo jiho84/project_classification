@@ -1,23 +1,51 @@
-# Kedro catalog focused on raw source and serialized outputs
+# Kedro catalog for debugging - Raw input and pipeline outputs only
+# MLflow tracking disabled - all outputs saved to data/ folders
 
+# ============================================================================
+# RAW INPUT (do not delete)
+# ============================================================================
 raw_account_data:
   type: kedro_datasets.pandas.ParquetDataset
-  filepath: data/01_raw/dataset.parquet
+  filepath: data/01_raw/dataset2_fixed.parquet
   load_args:
     engine: pyarrow
+    use_legacy_dataset: true  # Fix: PyArrow new Dataset API compatibility issue
   save_args:
     engine: pyarrow
     compression: zstd
 
+raw_missing_stats:
+  type: json.JSONDataset
+  filepath: data/08_reporting/raw_missing_stats.json
+  save_args:
+    ensure_ascii: false
+    indent: 2
+
+# ============================================================================
+# INGESTION PIPELINE - Output: standardized_data
+# ============================================================================
 validated_raw_data:
   type: MemoryDataset
 
-standardized_data:
+standardized_data_raw:
   type: MemoryDataset
+
+standardized_data:
+  type: kedro_datasets.pandas.ParquetDataset
+  filepath: data/02_intermediate/standardized_data.parquet
+  save_args:
+    engine: pyarrow
+    compression: zstd
+    index: false
+  load_args:
+    engine: pyarrow
 
 ingestion_metadata:
   type: MemoryDataset
 
+# ============================================================================
+# PREPROCESS PIPELINE - Output: validated_data
+# ============================================================================
 cleaned_data:
   type: MemoryDataset
 
@@ -31,8 +59,18 @@ validated_data_raw:
   type: MemoryDataset
 
 validated_data:
-  type: MemoryDataset
+  type: kedro_datasets.pandas.ParquetDataset
+  filepath: data/03_primary/validated_data.parquet
+  save_args:
+    engine: pyarrow
+    compression: zstd
+    index: false
+  load_args:
+    engine: pyarrow
 
+# ============================================================================
+# FEATURE PIPELINE - Output: base_table
+# ============================================================================
 feature_data:
   type: MemoryDataset
 
@@ -40,136 +78,53 @@ selected_features:
   type: MemoryDataset
 
 base_table:
+  type: kedro_datasets.pandas.ParquetDataset
+  filepath: data/04_feature/base_table.parquet
+  save_args:
+    engine: pyarrow
+    compression: zstd
+    index: false
+  load_args:
+    engine: pyarrow
+
+# ============================================================================
+# SPLIT PIPELINE - Output: serialized_datasets (text + labels)
+# ============================================================================
+hf_dataset:
+  type: MemoryDataset
+
+label_names:
+  type: MemoryDataset
+
+split_datasets_raw:
   type: MemoryDataset
 
 split_datasets:
   type: MemoryDataset
 
-prepared_datasets:
-  type: MemoryDataset
+serialized_datasets:
+  type: pickle.PickleDataset
+  filepath: data/05_model_input/serialized_datasets.pkl
 
-prepared_datasets_mlflow:
+# ============================================================================
+# TRAIN PIPELINE - Output: tokenized_datasets (MLflow Artifact)
+# ============================================================================
+tokenized_datasets:
   type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
   dataset:
-    type: account_tax.datasets.partitioned_parquet.PartitionedParquetDataset
-    path: data/05_model_input/prepared_datasets
-    filename_suffix: ".parquet"
-    load_args:
-      engine: pyarrow
-    save_args:
-      engine: pyarrow
-      index: false
-  artifact_path: data/prepared_datasets
-
-text_datasets:
-  type: MemoryDataset
-
-text_datasets_mlflow:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: account_tax.datasets.partitioned_parquet.PartitionedParquetDataset
-    path: data/06_models/text_datasets
-    filename_suffix: ".parquet"
-    load_args:
-      engine: pyarrow
-    save_args:
-      engine: pyarrow
-      index: false
-  artifact_path: data/text_datasets
+    type: pickle.PickleDataset
+    filepath: data/06_models/tokenized_datasets.pkl
+  artifact_path: data/tokenized_datasets
 
 token_length_report:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/token_length_report.json
-    save_args:
-      indent: 2
-  artifact_path: analysis/token_diagnostics
+  type: json.JSONDataset
+  filepath: data/08_reporting/token_length_report.json
+  save_args:
+    ensure_ascii: false
+    indent: 2
 
-tokenized_datasets:
+tokenizer:
   type: MemoryDataset
 
-# Training pipeline outputs
-tokenization_metadata:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/tokenization_metadata.json
-    save_args:
-      indent: 2
-  artifact_path: metadata/tokenization
-
-base_model:
+trainer_ready_data:
   type: MemoryDataset
-
-model_metadata:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/model_metadata.json
-    save_args:
-      indent: 2
-  artifact_path: metadata/model
-
-optimized_model:
-  type: MemoryDataset
-
-optimization_metadata:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/optimization_metadata.json
-    save_args:
-      indent: 2
-  artifact_path: metadata/optimization
-
-trainer_components:
-  type: MemoryDataset
-
-trainer_metadata:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/trainer_metadata.json
-    save_args:
-      indent: 2
-  artifact_path: metadata/trainer
-
-trained_model:
-  type: MemoryDataset
-
-training_metrics:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/training_metrics.json
-    save_args:
-      indent: 2
-  artifact_path: metrics/training
-
-training_artifacts:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/training_artifacts.json
-    save_args:
-      indent: 2
-  artifact_path: artifacts/training
-
-evaluation_metrics:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/evaluation_metrics.json
-    save_args:
-      indent: 2
-  artifact_path: metrics/evaluation
-
-evaluation_artifacts:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: kedro_datasets.json.JSONDataset
-    filepath: data/08_reporting/evaluation_artifacts.json
-    save_args:
-      indent: 2
-  artifact_path: artifacts/evaluation

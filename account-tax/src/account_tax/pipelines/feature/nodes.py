@@ -88,11 +88,10 @@ def build_features(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
 
 def select_features(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """
-    Select specific features and label columns based on configuration.
-    Maintains the order specified in the configuration.
+    Select specific features and label columns, then prepare for Dataset conversion.
 
-    Pipeline Order: 9th step (Feature pipeline, 2nd node)
-    Role: Feature selection - picks relevant columns in specified order
+    Pipeline Order: 9th step (Feature pipeline, final node)
+    Role: Feature selection + data cleaning for downstream processing
 
     Args:
         data: Input DataFrame from build_features
@@ -101,11 +100,12 @@ def select_features(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
             - label: Label column name (acct_code)
 
     Returns:
-        DataFrame with selected features and label in specified order
+        DataFrame with selected features and label in specified order,
+        cleaned of nulls in label column and duplicates
 
     Example:
-        Input: 56 columns
-        Output: 25 columns (24 features + label)
+        Input: 56 columns, 10000 rows
+        Output: 25 columns (24 features + label), ~9900 rows (after cleaning)
     """
     # Get features and label from params (no defaults)
     features = params['features']
@@ -127,46 +127,21 @@ def select_features(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
         if label not in ordered_columns:
             ordered_columns.append(label)
     else:
-        logger.warning(f"Label column '{label}' not found in data")
+        raise ValueError(f"Label column '{label}' is required but not found in data")
 
     # Select the columns in specified order
-    if ordered_columns:
-        selected_data = data[ordered_columns]
-        logger.info(f"Selected {len(ordered_columns)} columns in order")
-        logger.info(f"First 5 columns: {ordered_columns[:5]}")
-        logger.info(f"Features: {len([c for c in ordered_columns if c != label])}, Label: {label}")
-    else:
+    if not ordered_columns:
         raise ValueError("No columns to select")
 
-    return selected_data
+    selected_data = data[ordered_columns]
+    logger.info(f"Selected {len(ordered_columns)} columns in order")
+    logger.info(f"Features: {len([c for c in ordered_columns if c != label])}, Label: {label}")
 
+    # Clean data: remove nulls in label and duplicates (previously in prepare_dataset_inputs)
+    initial_rows = len(selected_data)
+    base_table = selected_data.dropna(subset=[label]).drop_duplicates().reset_index(drop=True)
 
-def prepare_dataset_inputs(
-    data: pd.DataFrame,
-    params: Dict[str, Any],
-) -> pd.DataFrame:
-    """
-    Prepare the feature table for downstream Dataset conversion.
-
-    Pipeline Order: Final step in feature pipeline, before splitting
-    Role: Provide a cleaned base table with only necessary rows.
-
-    Args:
-        data: Input DataFrame with selected features and label
-        params: Parameters containing:
-            - label_column: Name of the label column
-
-    Returns:
-        Cleaned DataFrame ready for Dataset conversion
-    """
-    label_column = params.get("label_column", "acct_code")
-
-    if label_column not in data.columns:
-        raise ValueError(f"Label column '{label_column}' not found in data")
-
-    base_table = data.dropna(subset=[label_column]).drop_duplicates().reset_index(drop=True)
-
-    logger.info("Base table prepared for Dataset conversion: %s", base_table.shape)
-    logger.info("Unique labels detected: %s", base_table[label_column].nunique())
+    logger.info(f"Data cleaning: {initial_rows} → {len(base_table)} rows")
+    logger.info(f"Unique labels: {base_table[label].nunique()}")
 
     return base_table
