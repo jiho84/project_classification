@@ -6,8 +6,8 @@ import logging
 import random
 from typing import Dict, List, Tuple, Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from datasets import Dataset, DatasetDict, ClassLabel
 from transformers import AutoTokenizer
 import mlflow
@@ -227,37 +227,20 @@ def labelize_and_cast(
     return encoded
 
 
-def serialize_to_text(
+def prepare_text_fields(
     split_datasets: DatasetDict,
-    serialization_params: Dict[str, Any]
+    serialization_params: Dict[str, Any],
 ) -> DatasetDict:
-    """
-    Serialize feature columns to text for NLP models.
+    """Format numeric/date columns and normalize missing values as strings.
 
     Args:
-        split_datasets: DatasetDict with feature columns + labels
-        serialization_params: Configuration dict with:
-            - text_columns: List of columns to serialize ([] = all except labels, acct_code)
-            - separator: String separator between items (default ", ")
-            - key_value_separator: String separator between key and value (default ": ")
-            - include_column_names: Whether to include "col: value" format
-            - num_proc: Number of processes for parallel processing
+        split_datasets: DatasetDict prior to text serialization
+        serialization_params: Same configuration dict used for serialization
 
     Returns:
-        DatasetDict with 'text' and 'labels' columns
-
-    Example:
-        >>> serialized = serialize_to_text(
-        ...     split_datasets=split_data,
-        ...     serialization_params={"text_columns": [], "separator": "|", "key_value_separator": "="}
-        ... )
-        >>> print(serialized["train"][0]["text"][:100])
-        'col1=value1|col2=value2|...'
+        DatasetDict with feature columns converted to normalized strings
     """
     text_columns = serialization_params.get("text_columns", [])
-    separator = serialization_params.get("separator", ", ")
-    key_value_separator = serialization_params.get("key_value_separator", ": ")
-    include_column_names = serialization_params.get("include_column_names", True)
     num_proc = serialization_params.get("num_proc", 4)
 
     if not text_columns:
@@ -266,15 +249,39 @@ def serialize_to_text(
             if col not in ["labels", "acct_code"]
         ]
 
-    def serialize_function(examples):
-        # Convert batch dict to DataFrame for vectorized operations
+    date_cols = [col for col in text_columns if "date" in col.lower()]
+    amount_cols = [col for col in text_columns if "amount" in col.lower()]
+
+    def format_amount_series(series: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(series, errors="coerce")
+        sign = np.sign(numeric.fillna(0)).astype(int)
+        exponent = np.zeros(len(numeric), dtype=int)
+        mant = np.zeros(len(numeric), dtype=float)
+
+        nonzero_mask = numeric.notna() & (numeric != 0)
+        abs_vals = numeric[nonzero_mask].abs()
+        if not abs_vals.empty:
+            exponents = np.floor(np.log10(abs_vals)).astype(int)
+            exponent[nonzero_mask] = exponents
+            mant[nonzero_mask] = abs_vals / np.power(10.0, exponents)
+
+        mant = np.round(mant, 4)
+
+        result = np.full(len(numeric), None, dtype=object)
+        valid_idx = np.where(numeric.notna())[0]
+        for idx in valid_idx:
+            result[idx] = (
+                f"sign={sign[idx]}| "
+                f"mant={mant[idx]:.4f}| "
+                f"exponent={exponent[idx]}"
+            )
+
+        return pd.Series(result, index=series.index)
+
+    def format_batch(examples: Dict[str, Any]) -> Dict[str, Any]:
+        formatted = dict(examples)
         df = pd.DataFrame({col: examples[col] for col in text_columns})
 
-        # Pattern-based column formatting
-        date_cols = [col for col in df.columns if 'date' in col.lower()]
-        amount_cols = [col for col in df.columns if 'amount' in col.lower()]
-
-        # 1. Format date columns: Int64 → "YYYY-MM-DD"
         for col in date_cols:
             try:
                 df[col] = (
@@ -284,15 +291,12 @@ def serialize_to_text(
             except Exception:
                 pass  # Keep original if conversion fails
 
-        # 2. Format amount columns: float → int → string (no ".0")
         for col in amount_cols:
             try:
-                numeric = pd.to_numeric(df[col], errors="coerce")
-                df[col] = numeric.round(0).astype("Int64")
+                df[col] = format_amount_series(df[col])
             except Exception:
-                pass  # Keep original if conversion fails
+                pass
 
-        # 3. Normalize missing placeholders across all columns
         df = df.astype("string")
         df = df.fillna(MISSING_TOKEN)
         df = df.replace(
@@ -305,38 +309,79 @@ def serialize_to_text(
             }
         )
 
-        # 4. Build text strings
+        for col in text_columns:
+            formatted[col] = df[col].tolist()
+
+        return formatted
+
+    logger.info("Formatting text fields prior to serialization...")
+    formatted_datasets = split_datasets.map(
+        format_batch,
+        batched=True,
+        num_proc=num_proc,
+        desc="Formatting text fields",
+    )
+
+    return formatted_datasets
+
+
+def serialize_to_text(
+    split_datasets: DatasetDict,
+    serialization_params: Dict[str, Any]
+) -> DatasetDict:
+    """Join prepared feature columns into text strings."""
+
+    text_columns = serialization_params.get("text_columns", [])
+    separator = serialization_params.get("separator", ", ")
+    key_value_separator = serialization_params.get("key_value_separator", ": ")
+    include_column_names = serialization_params.get("include_column_names", True)
+    num_proc = serialization_params.get("num_proc", 4)
+
+    if not text_columns:
+        text_columns = [
+            col for col in split_datasets["train"].column_names
+            if col not in ["labels", "acct_code"]
+        ]
+
+    def join_batch(examples: Dict[str, Any]) -> Dict[str, Any]:
         if include_column_names:
-            # Vectorized string formatting with column names
-            texts = df.apply(
-                lambda row: separator.join([
-                    f"{col}{key_value_separator}{str(row[col])}" for col in text_columns
-                ]),
-                axis=1
-            ).tolist()
+            texts = [
+                separator.join(
+                    f"{col}{key_value_separator}{examples[col][i]}" for col in text_columns
+                )
+                for i in range(len(examples[text_columns[0]]))
+            ]
         else:
-            # Optimized vectorized join without column names
-            texts = df.astype(str).agg(separator.join, axis=1).tolist()
+            texts = [
+                separator.join(examples[col][i] for col in text_columns)
+                for i in range(len(examples[text_columns[0]]))
+            ]
+        result = dict(examples)
+        result["text"] = texts
+        return result
 
-        return {"text": texts}
-
-    logger.info("Serializing feature columns to text...")
+    logger.info("Serializing formatted feature columns to text...")
     serialized = split_datasets.map(
-        serialize_function,
+        join_batch,
         batched=True,
         num_proc=num_proc,
         remove_columns=[c for c in split_datasets["train"].column_names if c not in ["labels"]],
-        desc="Serializing to text"
+        desc="Serializing to text",
     )
 
-    # Log statistics
     for split_name in serialized.keys():
         split_data = serialized[split_name]
         text_lengths = [len(text) for text in split_data["text"]]
         avg_len = np.mean(text_lengths)
         max_len = max(text_lengths)
-        logger.info(f"{split_name}: {len(split_data)} samples, avg text chars: {avg_len:.1f}, max: {max_len}")
+        logger.info(
+            "%s: %s samples, avg text chars: %.1f, max: %s",
+            split_name,
+            len(split_data),
+            avg_len,
+            max_len,
+        )
         if len(split_data) > 0:
-            logger.debug(f"Sample text: {split_data[0]['text'][:200]}...")
+            logger.debug("Sample text: %s...", split_data[0]["text"][:200])
 
     return serialized

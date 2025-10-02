@@ -27,7 +27,7 @@ train:
   # Tokenization parameters
   tokenization:
     model_name: "Qwen/Qwen3-4B"  # Qwen3-4B (released 2025-05)
-    max_length: 512
+    max_length: 256
     truncation: true
     padding: false  # Dynamic padding in collator
     num_proc: 8             # Parallel workers (increased from 4 to 8)

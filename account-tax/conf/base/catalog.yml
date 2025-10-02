@@ -6,10 +6,9 @@
 # ============================================================================
 raw_account_data:
   type: kedro_datasets.pandas.ParquetDataset
-  filepath: data/01_raw/dataset2_fixed.parquet
+  filepath: data/01_raw/dataset2.parquet
   load_args:
     engine: pyarrow
-    use_legacy_dataset: true  # Fix: PyArrow new Dataset API compatibility issue
   save_args:
     engine: pyarrow
     compression: zstd

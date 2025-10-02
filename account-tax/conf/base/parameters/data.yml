@@ -58,7 +58,6 @@ feature:
       - card_number
       - supply_amount
       - vat_amount
-      - total_amount
       - item
     label: acct_code
   dataset_conversion:

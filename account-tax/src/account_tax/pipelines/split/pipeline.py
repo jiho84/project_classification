@@ -5,6 +5,7 @@ from .nodes import (
     create_dataset,
     to_hf_and_split,
     labelize_and_cast,
+    prepare_text_fields,
     serialize_to_text,
 )
 
@@ -48,8 +49,15 @@ def create_pipeline(**kwargs) -> Pipeline:
             tags="split",
         ),
         node(
-            func=serialize_to_text,
+            func=prepare_text_fields,
             inputs=["split_datasets", "params:train.serialization"],
+            outputs="formatted_datasets",
+            name="prepare_text_fields",
+            tags="split",
+        ),
+        node(
+            func=serialize_to_text,
+            inputs=["formatted_datasets", "params:train.serialization"],
             outputs="serialized_datasets",
             name="serialize_to_text",
             tags="split",
