@@ -145,3 +145,57 @@ def select_features(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     logger.info(f"Unique labels: {base_table[label].nunique()}")
 
     return base_table
+
+
+def filter_minority_classes(data: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Remove label classes whose sample count does not exceed the configured minimum.
+
+    Args:
+        data: DataFrame produced by ``select_features``.
+        params: Feature selection parameters containing:
+            - label: Label column name
+            - min_label_count: Classes with <= this many samples are dropped
+
+    Returns:
+        DataFrame filtered to majority classes, index reset for downstream Datasets.
+    """
+    label_col = params.get("label")
+    if not label_col:
+        raise ValueError("Feature selection parameters must include a 'label' entry.")
+    if label_col not in data.columns:
+        raise ValueError(f"Label column '{label_col}' not present in base table.")
+
+    min_count = int(params.get("min_label_count", 0))
+    if min_count <= 0:
+        logger.info("min_label_count <= 0; skipping minority class filtering.")
+        return data
+
+    label_counts = data[label_col].value_counts()
+    keep_labels = label_counts[label_counts > min_count].index
+    removed_labels = label_counts[label_counts <= min_count]
+
+    filtered = data[data[label_col].isin(keep_labels)].reset_index(drop=True)
+
+    logger.info(
+        "Minority class filtering applied: kept %s classes (> %s samples), removed %s rows.",
+        len(keep_labels),
+        min_count,
+        int(removed_labels.sum()),
+    )
+    if not keep_labels.empty:
+        logger.debug("Remaining classes after filtering: %s", list(keep_labels))
+    if not removed_labels.empty:
+        logger.info(
+            "Removed classes (label -> count): %s",
+            removed_labels.to_dict(),
+        )
+
+    remaining_classes = filtered[label_col].nunique()
+    if remaining_classes < 2:
+        raise ValueError(
+            f"Only {remaining_classes} label class(es) remaining after filtering; "
+            "adjust 'min_label_count' to keep at least two classes."
+        )
+
+    return filtered

@@ -41,7 +41,7 @@ train:
     lora_alpha: 256
     lora_dropout: 0.05
     target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-    layers_to_transform: [30, 31, 32, 33, 34, 35]
+    layers_to_transform: [28, 29, 30, 31, 32, 33, 34, 35]
     modules_to_save: ["score"]
     bias: "lora_only"
 
@@ -55,27 +55,28 @@ train:
     num_labels: null
     torch_dtype: "bfloat16"
     trust_remote_code: true
-    gradient_checkpointing: true
+    gradient_checkpointing: false
 
   training_args:
     output_dir: "data/06_models/checkpoints"
     num_train_epochs: 3
-    per_device_train_batch_size: 16
-    per_device_eval_batch_size: 16
+    per_device_train_batch_size: 32
+    per_device_eval_batch_size: 32
     gradient_accumulation_steps: 1
-    learning_rate: 2.0e-5
-    weight_decay: 0.01
-    warmup_ratio: 0.1
+    learning_rate: 1.0e-5
+    weight_decay: 0.002
+    warmup_ratio: 0.01
+    lr_scheduler_type: "cosine"
     eval_strategy: "steps"
-    eval_steps: 500
+    eval_steps: 1000
     save_strategy: "steps"
-    save_steps: 1000
+    save_steps: 5000
     save_total_limit: 3
     logging_steps: 10
     report_to: ["mlflow"]
     bf16: true
     fp16: false
-    gradient_checkpointing: true
+    gradient_checkpointing: false
     dataloader_num_workers: 8
     seed: 42
     load_best_model_at_end: true
@@ -90,12 +91,16 @@ train:
   deepspeed:
     num_gpus: 4
     config:
-      train_micro_batch_size_per_gpu: 16
+      train_micro_batch_size_per_gpu: 32
       gradient_accumulation_steps: 1
       zero_optimization:
         stage: 2
-        offload_optimizer:
+        offload_param:
           device: "none"
+          pin_memory: true
+        offload_optimizer:
+          device: "cpu"
+          pin_memory: true
         allgather_bucket_size: 5e8
         reduce_bucket_size: 5e8
       gradient_clipping: 1.0

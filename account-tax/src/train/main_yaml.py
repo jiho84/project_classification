@@ -70,6 +70,13 @@ def build_training_arguments(args_cfg: Dict[str, Any], deepspeed_cfg: Dict[str, 
     cfg = dict(args_cfg)
     if deepspeed_cfg:
         cfg["deepspeed"] = deepspeed_cfg
+        # Override TrainingArguments with DeepSpeed config values to avoid mismatch errors
+        if "train_micro_batch_size_per_gpu" in deepspeed_cfg:
+            cfg["per_device_train_batch_size"] = deepspeed_cfg["train_micro_batch_size_per_gpu"]
+            LOGGER.info("DeepSpeed override: per_device_train_batch_size = %s", deepspeed_cfg["train_micro_batch_size_per_gpu"])
+        if "gradient_accumulation_steps" in deepspeed_cfg:
+            cfg["gradient_accumulation_steps"] = deepspeed_cfg["gradient_accumulation_steps"]
+            LOGGER.info("DeepSpeed override: gradient_accumulation_steps = %s", deepspeed_cfg["gradient_accumulation_steps"])
     # Trainer expects lists for report_to, etc.
     if "report_to" in cfg and isinstance(cfg["report_to"], str):
         cfg["report_to"] = [cfg["report_to"]]

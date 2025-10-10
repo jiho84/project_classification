@@ -60,5 +60,6 @@ feature:
       - vat_amount
       - item
     label: acct_code
+    min_label_count: 3
   dataset_conversion:
     label_column: acct_code
