@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
+import torch.nn as nn
 import yaml
+import numpy as np
 from datasets import load_from_disk
 from transformers import (
     AutoModelForSequenceClassification,
@@ -198,13 +200,69 @@ def main() -> None:
         predictions, labels = eval_pred
         return compute_accuracy(predictions, labels)
 
-    trainer = Trainer(
+    loss_cfg = cfg.get("loss", {})
+    use_class_weights = bool(loss_cfg.get("use_class_weights", False))
+    class_weight_alpha = float(loss_cfg.get("class_weight_alpha", 1.0))
+
+    class_weights_tensor: torch.Tensor | None = None
+    if use_class_weights:
+        train_labels = np.array(train_dataset["labels"])
+        class_counts = np.bincount(train_labels, minlength=num_labels)
+        # For zero-sample classes, set small default value to avoid division by zero
+        zero_mask = class_counts == 0
+        num_zero_classes = zero_mask.sum()
+        if num_zero_classes > 0:
+            # Set default count as 1% of mean count for non-zero classes, minimum 1
+            non_zero_counts = class_counts[~zero_mask]
+            default_count = max(1.0, non_zero_counts.mean() * 0.01)
+            class_counts = class_counts.astype(np.float32)
+            class_counts[zero_mask] = default_count
+            LOGGER.info("Zero-sample classes: %d/%d (default count: %.2f)", num_zero_classes, num_labels, default_count)
+
+        class_weights = (len(train_labels) / (num_labels * class_counts)).astype(np.float32)
+        if class_weight_alpha != 1.0:
+            class_weights = class_weights ** class_weight_alpha
+        class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
+        LOGGER.info(
+            "Class weights applied (alpha=%s): non-zero classes=%d, weight range=[%.4f, %.4f]",
+            class_weight_alpha,
+            num_labels - num_zero_classes,
+            class_weights.min(),
+            class_weights.max(),
+        )
+    else:
+        LOGGER.info("Class weights disabled; using uniform loss.")
+
+    class WeightedTrainer(Trainer):
+        def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.class_weights = class_weights
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            labels = inputs.get("labels")
+            if labels is None:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+
+            # Remove labels to avoid default loss computation
+            inputs = dict(inputs)
+            labels = inputs.pop("labels")
+
+            outputs = model(**inputs)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device) if self.class_weights is not None else None)
+            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1).to(logits.device))
+
+            return (loss, outputs) if return_outputs else loss
+
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=collator,
+        class_weights=class_weights_tensor,
         compute_metrics=compute_metrics_fn if eval_dataset is not None else None,
     )
 

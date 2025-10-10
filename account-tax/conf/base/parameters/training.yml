@@ -83,6 +83,10 @@ train:
     metric_for_best_model: "accuracy"
     greater_is_better: true
 
+  loss:
+    use_class_weights: true
+    class_weight_alpha: 0.5
+
   lora:
     enable: true
     config:
