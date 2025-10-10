@@ -6,7 +6,7 @@
 # ============================================================================
 raw_account_data:
   type: kedro_datasets.pandas.ParquetDataset
-  filepath: data/01_raw/dataset2.parquet
+  filepath: data/01_raw/dataset3.parquet
   load_args:
     engine: pyarrow
   save_args:
@@ -108,12 +108,9 @@ serialized_datasets:
 # ============================================================================
 # TRAIN PIPELINE - Output: tokenized_datasets (MLflow Artifact)
 # ============================================================================
-tokenized_datasets:
-  type: kedro_mlflow.io.artifacts.MlflowArtifactDataset
-  dataset:
-    type: pickle.PickleDataset
-    filepath: data/06_models/tokenized_datasets.pkl
-  artifact_path: data/tokenized_datasets
+tokenized_dataset_path:
+  type: pickle.PickleDataset
+  filepath: data/06_models/tokenized_dataset_path.pkl
 
 token_length_report:
   type: json.JSONDataset
@@ -126,4 +123,7 @@ tokenizer:
   type: MemoryDataset
 
 trainer_ready_data:
+  type: MemoryDataset
+
+training_run_info:
   type: MemoryDataset

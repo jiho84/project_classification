@@ -1,104 +1,112 @@
-# Training Pipeline Parameters (BlueScreen Design)
-# This configuration follows the train_bluescreen.md specification
+# Training pipeline parameters
 
+# ----------------------------------------------------------------------------
 # Split configuration (shared with split pipeline)
+# ----------------------------------------------------------------------------
 split:
   label_column: acct_code
   seed: 42
-  test_size: 0.2          # 20% for test set
-  val_size: 0.1           # 10% for validation set (from test set)
-  max_classes: 280       # Maximum label slots (273 real labels + dummy placeholders)
-  labelize_num_proc: 8    # Parallel workers for label encoding (increased from 4 to 8)
+  test_size: 0.2
+  val_size: 0.1
+  max_classes: 280
+  labelize_num_proc: 8
+  extract_ratio: 0.1
+  extract_seed: 42
+  stratify_extract: true
 
-  # Optional data extraction (sampling)
-  extract_ratio: 0.1     # null = use full dataset, 0.1 = use 10% of data
-  extract_seed: 42        # Random seed for extraction
-  stratify_extract: true  # Maintain label distribution when sampling
-
-# Text serialization for NLP
+# ----------------------------------------------------------------------------
+# Tokenization, model, and training configuration
+# ----------------------------------------------------------------------------
 train:
   serialization:
-    text_columns: []            # Empty list = use all feature columns (labels, acct_code excluded)
-    separator: "| "              # Separator between items
-    key_value_separator: ":"   # Separator between key and value
-    include_column_names: true  # Format: "col_name: value, ..."
-    num_proc: 8                 # Parallel workers (increased from 4 to 8)
+    text_columns: []
+    separator: "| "
+    key_value_separator: ":"
+    include_column_names: true
+    num_proc: 8
 
-  # Tokenization parameters
   tokenization:
-    model_name: "Qwen/Qwen3-4B"  # Qwen3-4B (released 2025-05)
+    model_name: "Qwen/Qwen3-4B"
     max_length: 256
     truncation: true
-    padding: false  # Dynamic padding in collator
-    num_proc: 8             # Parallel workers (increased from 4 to 8)
-    sample_size: 10         # Number of samples to extract per split (0 = no sampling)
+    padding: "longest"
+    num_proc: 8
+    sample_size: 10
+    output_dir: "data/06_models/tokenized_datasets"
 
-  # Model configuration
+  # Default LoRA configuration (anchored for reuse)
+  lora_defaults: &lora_cfg
+    task_type: "SEQ_CLS"
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    layers_to_transform: [30, 31, 32, 33, 34, 35]
+    modules_to_save: ["score"]
+    bias: "lora_only"
+
+  data:
+    train_split: "train"
+    eval_split: "valid"
+    test_split: "test"
+
   model:
-    name: "Qwen/Qwen3-4B"       # HuggingFace model ID
-    num_labels: null             # Auto-inferred from data
-    torch_dtype: "bfloat16"      # "float16" | "bfloat16" | "float32"
-    device_map: "auto"
+    name_or_path: "Qwen/Qwen3-4B"
+    num_labels: null
+    torch_dtype: "bfloat16"
+    trust_remote_code: true
     gradient_checkpointing: true
-    trust_remote_code: true      # Required for Qwen models
 
-  # DeepSpeed Stage 2 Configuration
-  # This dict is passed directly to TrainingArguments (no JSON file needed)
-  deepspeed:
-    enable: false  # Set to true to enable DeepSpeed
-    config:
-      train_micro_batch_size_per_gpu: 8
-      gradient_accumulation_steps: 4
-      zero_optimization:
-        stage: 2
-        offload_optimizer:
-          device: cpu
-          pin_memory: true
-        allgather_partitions: true
-        allgather_bucket_size: 2e8
-        overlap_comm: true
-        reduce_scatter: true
-        reduce_bucket_size: 2e8
-        contiguous_gradients: true
-      gradient_clipping: 1.0
-      wall_clock_breakdown: true
-      fp16:
-        enabled: false
-      bf16:
-        enabled: true
-
-  # LoRA Configuration (PEFT)
-  lora:
-    enable: false  # Set to true to enable LoRA
-    r: 8  # LoRA rank
-    alpha: 32  # LoRA alpha (scaling factor)
-    target_modules: ["query", "value"]  # Attention modules to apply LoRA
-    dropout: 0.05
-    bias: "none"  # "none" | "all" | "lora_only"
-    task_type: "SEQ_CLS"  # "CAUSAL_LM" | "SEQ_CLS" | "SEQ_2_SEQ_LM"
-
-  # Training Arguments
-  training:
+  training_args:
     output_dir: "data/06_models/checkpoints"
     num_train_epochs: 3
-    max_steps: null  # null = use epochs
-    per_device_train_batch_size: 8
+    per_device_train_batch_size: 16
     per_device_eval_batch_size: 16
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 1
     learning_rate: 2.0e-5
     weight_decay: 0.01
     warmup_ratio: 0.1
-    eval_strategy: "steps"  # "steps" | "epoch"
+    eval_strategy: "steps"
     eval_steps: 500
-    save_strategy: "steps"  # "steps" | "epoch"
+    save_strategy: "steps"
     save_steps: 1000
-    save_total_limit: 3  # Max checkpoints to keep
+    save_total_limit: 3
     logging_steps: 10
+    report_to: ["mlflow"]
+    bf16: true
     fp16: false
-    bf16: true  # Recommended for A100/H100
     gradient_checkpointing: true
-    dataloader_num_workers: 4
+    dataloader_num_workers: 8
     seed: 42
     load_best_model_at_end: true
-    metric_for_best_model: "f1"
+    metric_for_best_model: "accuracy"
     greater_is_better: true
+
+  lora:
+    enable: true
+    config:
+      <<: *lora_cfg
+
+  deepspeed:
+    num_gpus: 4
+    config:
+      train_micro_batch_size_per_gpu: 16
+      gradient_accumulation_steps: 1
+      zero_optimization:
+        stage: 2
+        offload_optimizer:
+          device: "none"
+        allgather_bucket_size: 5e8
+        reduce_bucket_size: 5e8
+      gradient_clipping: 1.0
+      bf16:
+        enabled: true
+      fp16:
+        enabled: false
+
+  training_script:
+    path: "src/train/main_yaml.py"
+    config_output_path: "data/06_models/run_config/train_config.yml"
+
+  metrics:
+    path: "data/06_models/metrics/train_metrics.json"

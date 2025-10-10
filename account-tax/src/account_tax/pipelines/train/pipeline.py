@@ -3,6 +3,7 @@
 from kedro.pipeline import Pipeline, node
 from .nodes import (
     tokenize_datasets,
+    launch_training,
 )
 
 
@@ -17,8 +18,15 @@ def create_pipeline(**kwargs) -> Pipeline:
         node(
             func=tokenize_datasets,
             inputs=["serialized_datasets", "params:train.tokenization"],
-            outputs=["tokenized_datasets", "token_length_report"],
+            outputs=["tokenized_dataset_path", "token_length_report"],
             name="tokenize_datasets",
+            tags="train",
+        ),
+        node(
+            func=launch_training,
+            inputs=["tokenized_dataset_path", "params:train"],
+            outputs="training_run_info",
+            name="launch_training",
             tags="train",
         ),
     ])
