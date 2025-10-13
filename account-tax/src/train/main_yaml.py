@@ -35,8 +35,19 @@ from transformers import (
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
     set_seed,
 )
+
+try:
+    import mlflow
+except ImportError:
+    mlflow = None
+
+try:
+    from transformers.integrations import MLflowCallback
+except ImportError:
+    MLflowCallback = None
 from transformers.trainer_utils import get_last_checkpoint
 
 try:
@@ -49,6 +60,24 @@ except ImportError:  # pragma: no cover - optional dependency guard
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _ensure_dir(path: Path) -> Path:
+    """Create parent directories for the given path and return the path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _ensure_dirname(path: Path) -> Path:
+    """Create the directory itself (not just parent) and return the path."""
+
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def is_rank_zero() -> bool:
+    return os.environ.get("LOCAL_RANK", "0") == "0"
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,10 +104,12 @@ def build_training_arguments(args_cfg: Dict[str, Any], deepspeed_cfg: Dict[str, 
         # Override TrainingArguments with DeepSpeed config values to avoid mismatch errors
         if "train_micro_batch_size_per_gpu" in deepspeed_cfg:
             cfg["per_device_train_batch_size"] = deepspeed_cfg["train_micro_batch_size_per_gpu"]
+        if is_rank_zero():
             LOGGER.info("DeepSpeed override: per_device_train_batch_size = %s", deepspeed_cfg["train_micro_batch_size_per_gpu"])
         if "gradient_accumulation_steps" in deepspeed_cfg:
             cfg["gradient_accumulation_steps"] = deepspeed_cfg["gradient_accumulation_steps"]
-            LOGGER.info("DeepSpeed override: gradient_accumulation_steps = %s", deepspeed_cfg["gradient_accumulation_steps"])
+            if is_rank_zero():
+                LOGGER.info("DeepSpeed override: gradient_accumulation_steps = %s", deepspeed_cfg["gradient_accumulation_steps"])
     # Trainer expects lists for report_to, etc.
     if "report_to" in cfg and isinstance(cfg["report_to"], str):
         cfg["report_to"] = [cfg["report_to"]]
@@ -176,9 +207,8 @@ def main() -> None:
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=num_labels,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         trust_remote_code=model_cfg.get("trust_remote_code", False),
-        resume_download=bool(checkpoint),
     )
 
     if getattr(model.config, "pad_token_id", None) is None:
@@ -217,21 +247,191 @@ def main() -> None:
             default_count = max(1.0, non_zero_counts.mean() * 0.01)
             class_counts = class_counts.astype(np.float32)
             class_counts[zero_mask] = default_count
-            LOGGER.info("Zero-sample classes: %d/%d (default count: %.2f)", num_zero_classes, num_labels, default_count)
+            if is_rank_zero():
+                LOGGER.info("Zero-sample classes: %d/%d (default count: %.2f)", num_zero_classes, num_labels, default_count)
 
-        class_weights = (len(train_labels) / (num_labels * class_counts)).astype(np.float32)
+        class_weight_min = loss_cfg.get("class_weight_min", 0.2)
+        class_weight_max = loss_cfg.get("class_weight_max", 8.0)
+        class_weight_min = float(class_weight_min) if class_weight_min is not None else None
+        class_weight_max = float(class_weight_max) if class_weight_max is not None else None
+        if class_weight_min is not None and class_weight_max is not None and class_weight_min > class_weight_max:
+            raise ValueError(
+                f"class_weight_min ({class_weight_min}) must be <= class_weight_max ({class_weight_max})."
+            )
+
+        dummy_value = float(loss_cfg.get("class_weight_dummy_value", 1.0))
+
+        num_classes = len(class_counts)
+        free_mask = ~zero_mask
+        free_count = int(free_mask.sum())
+        free_target = num_classes - dummy_value * num_zero_classes
+        if free_count > 0:
+            if class_weight_min is not None and free_target < class_weight_min * free_count:
+                adjusted = free_target / free_count
+                LOGGER.warning(
+                    "class_weight_min=%.4f is infeasible for %d non-dummy classes (target mean %.4f). "
+                    "Adjusting minimum to %.4f.",
+                    class_weight_min,
+                    free_count,
+                    free_target / free_count if free_count else 0.0,
+                    adjusted,
+                )
+                class_weight_min = adjusted
+            if class_weight_max is not None and free_target > class_weight_max * free_count:
+                adjusted = free_target / free_count
+                LOGGER.warning(
+                    "class_weight_max=%.4f is infeasible for %d non-dummy classes (target mean %.4f). "
+                    "Adjusting maximum to %.4f.",
+                    class_weight_max,
+                    free_count,
+                    free_target / free_count if free_count else 0.0,
+                    adjusted,
+                )
+                class_weight_max = adjusted
+
+        class_weights = (len(train_labels) / (num_labels * class_counts)).astype(np.float64)
         if class_weight_alpha != 1.0:
-            class_weights = class_weights ** class_weight_alpha
+            class_weights = np.power(class_weights, class_weight_alpha, dtype=np.float64)
+
+        free_weights = class_weights[free_mask].copy()
+        target_free_sum = max(0.0, num_classes - dummy_value * num_zero_classes)
+        if free_weights.size > 0:
+            for _ in range(100):
+                current_sum = free_weights.sum()
+                if current_sum <= 0:
+                    fill = target_free_sum / free_weights.size if free_weights.size > 0 else 0.0
+                    free_weights = np.full_like(free_weights, fill)
+                    current_sum = free_weights.sum()
+                scale = target_free_sum / current_sum if current_sum != 0 else 0.0
+                free_weights = free_weights * scale
+                if class_weight_min is not None:
+                    free_weights = np.maximum(free_weights, class_weight_min)
+                if class_weight_max is not None:
+                    free_weights = np.minimum(free_weights, class_weight_max)
+                new_sum = free_weights.sum()
+                if target_free_sum == 0 or abs(new_sum - target_free_sum) <= 1e-6 * max(1.0, target_free_sum):
+                    break
+            # Final rescale to correct residual drift while respecting caps
+            for _ in range(5):
+                free_sum = free_weights.sum()
+                if free_sum <= 0 or target_free_sum == 0:
+                    break
+                free_weights *= target_free_sum / free_sum
+                if class_weight_min is not None:
+                    free_weights = np.maximum(free_weights, class_weight_min)
+                if class_weight_max is not None:
+                    free_weights = np.minimum(free_weights, class_weight_max)
+
+        class_weights = np.full(num_classes, dummy_value, dtype=np.float64)
+        class_weights[free_mask] = free_weights
+        expected_free_sum = num_classes - dummy_value * num_zero_classes
+        if free_count > 0 and expected_free_sum > 0:
+            for _ in range(5):
+                free_sum = class_weights[free_mask].sum()
+                if free_sum <= 0:
+                    break
+                class_weights[free_mask] *= expected_free_sum / free_sum
+                if class_weight_min is not None:
+                    class_weights[free_mask] = np.maximum(class_weights[free_mask], class_weight_min)
+                if class_weight_max is not None:
+                    class_weights[free_mask] = np.minimum(class_weights[free_mask], class_weight_max)
+        class_weights[zero_mask] = dummy_value
+
+        class_weights = class_weights.astype(np.float32)
         class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
-        LOGGER.info(
-            "Class weights applied (alpha=%s): non-zero classes=%d, weight range=[%.4f, %.4f]",
-            class_weight_alpha,
-            num_labels - num_zero_classes,
-            class_weights.min(),
-            class_weights.max(),
-        )
+
+        min_cap_fraction = float(
+            np.mean(np.isclose(class_weights[free_mask], class_weight_min))
+        ) if class_weight_min is not None and free_count > 0 else 0.0
+        max_cap_fraction = float(
+            np.mean(np.isclose(class_weights[free_mask], class_weight_max))
+        ) if class_weight_max is not None and free_count > 0 else 0.0
+
+        report = {
+            "num_labels": int(num_labels),
+            "num_zero_classes": int(num_zero_classes),
+            "dummy_value": float(dummy_value),
+            "alpha": float(class_weight_alpha),
+            "min_config": float(class_weight_min) if class_weight_min is not None else None,
+            "max_config": float(class_weight_max) if class_weight_max is not None else None,
+            "min_weight": float(class_weights.min()),
+            "max_weight": float(class_weights.max()),
+            "mean_weight": float(class_weights.mean()),
+            "median_weight": float(np.median(class_weights)),
+            "p95_weight": float(np.percentile(class_weights, 95)),
+            "p99_weight": float(np.percentile(class_weights, 99)),
+            "cap_min_fraction": min_cap_fraction,
+            "cap_max_fraction": max_cap_fraction,
+        }
+
+        if is_rank_zero():
+            LOGGER.info(
+                "Class weights applied (alpha=%.3f, min=%.3f, max=%.3f, dummy=%.3f): non-zero classes=%d, "
+                "weight range=[%.4f, %.4f], mean=%.4f",
+                class_weight_alpha,
+                class_weight_min if class_weight_min is not None else float("nan"),
+                class_weight_max if class_weight_max is not None else float("nan"),
+                dummy_value,
+                num_labels - num_zero_classes,
+                report["min_weight"],
+                report["max_weight"],
+                report["mean_weight"],
+            )
+
+        if is_rank_zero():
+            report_path = metrics_cfg.get("class_weight_report")
+            if report_path:
+                path_obj = Path(report_path)
+                if not path_obj.is_absolute():
+                    path_obj = (PROJECT_ROOT / path_obj).resolve()
+                _ensure_dir(path_obj)
+                try:
+                    with open(path_obj, "w", encoding="utf-8") as fp:
+                        json.dump({**report, "weights": class_weights.tolist()}, fp, ensure_ascii=False, indent=2)
+                except Exception as exc:
+                    LOGGER.warning("Failed to write class weight report to %s: %s", path_obj, exc)
+
+            if mlflow is not None:
+                try:
+                    active_run = mlflow.active_run()
+                    if active_run is not None:
+                        mlflow.log_metrics(
+                            {
+                                "class_weight_min_actual": report["min_weight"],
+                                "class_weight_max_actual": report["max_weight"],
+                                "class_weight_cap_min_fraction": report["cap_min_fraction"],
+                                "class_weight_cap_max_fraction": report["cap_max_fraction"],
+                            }
+                        )
+                except Exception as exc:
+                    LOGGER.warning("Failed to log class weight metrics to MLflow: %s", exc)
     else:
-        LOGGER.info("Class weights disabled; using uniform loss.")
+        if is_rank_zero():
+            LOGGER.info("Class weights disabled; using uniform loss.")
+
+    class GPUMemoryCallback(TrainerCallback):
+        """Callback to monitor and log GPU memory usage during training."""
+
+        def __init__(self):
+            self.enabled = is_rank_zero() and torch.cuda.is_available()
+            self.gpu_count = torch.cuda.device_count() if self.enabled else 0
+            self.device_props = []
+            if self.enabled and self.gpu_count > 0:
+                props = torch.cuda.get_device_properties(0)
+                self.device_props.append(props)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            """Add GPU memory usage to logs."""
+            if not self.enabled or logs is None or self.gpu_count == 0:
+                return
+
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            total = self.device_props[0].total_memory / 1024**3
+            percent = (allocated / total) * 100 if total > 0 else 0
+
+            logs["gpu_mem"] = f"{allocated:.1f}GB/{total:.0f}GB ({percent:.0f}%)"
+            logs["gpu_reserved"] = f"{reserved:.1f}GB"
 
     class WeightedTrainer(Trainer):
         def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
@@ -240,20 +440,34 @@ def main() -> None:
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             labels = inputs.get("labels")
-            if labels is None:
+
+            if labels is None or self.class_weights is None:
+                # Fallback to default loss
                 return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
 
-            # Remove labels to avoid default loss computation
+            # Remove labels to prevent model from computing loss internally
             inputs = dict(inputs)
             labels = inputs.pop("labels")
 
+            # Forward pass without labels
             outputs = model(**inputs)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            logits = outputs.logits
 
-            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device) if self.class_weights is not None else None)
-            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1).to(logits.device))
+            # Custom weighted loss with ignore_index=-100
+            loss_fct = nn.CrossEntropyLoss(
+                weight=self.class_weights.to(logits.device, dtype=logits.dtype),
+                ignore_index=-100  # Important: ignore padding tokens!
+            )
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
 
             return (loss, outputs) if return_outputs else loss
+
+    # Create callbacks
+    callbacks = []
+    if torch.cuda.is_available():
+        callbacks.append(GPUMemoryCallback())
+    # Note: Regular step-based checkpoints (save_steps=100) work fine with DeepSpeed
+    # Epoch-end saves caused NCCL hangs, so we rely on step-based checkpoints + final PEFT save
 
     trainer = WeightedTrainer(
         model=model,
@@ -264,16 +478,152 @@ def main() -> None:
         data_collator=collator,
         class_weights=class_weights_tensor,
         compute_metrics=compute_metrics_fn if eval_dataset is not None else None,
+        callbacks=callbacks,
     )
 
-    trainer.train()
+    # Override MLflowCallback.on_train_end() to prevent subprocess hang
+    # The hang occurs when nested MLflow run tries to finalize and sync with parent process
+    if MLflowCallback is not None:
+        for callback in trainer.callback_handler.callbacks:
+            if isinstance(callback, MLflowCallback):
+                def safe_on_train_end(self, args, state, control, **kwargs):  # noqa: ARG001
+                    """
+                    Skip mlflow.end_run() that causes hang in subprocess.
 
-    trainer.save_model()
-    if trainer.state.is_world_process_zero():
-        metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
-        if eval_dataset is not None:
-            metrics.update(trainer.evaluate())
-        save_metrics(metrics, metrics_cfg.get("path"))
+                    Root cause: mlflow.end_run() tries to:
+                    1. Flush metrics to tracking server
+                    2. Sync artifacts to storage
+                    3. Update run status to FINISHED
+                    4. Notify parent run (for nested runs)
+
+                    Step 4 causes hang because subprocess cannot communicate
+                    with parent process's ThreadLocal MLflow context.
+
+                    Solution: Skip end_run() here. Parent Kedro process will
+                    handle run finalization after subprocess completes.
+                    """
+                    if is_rank_zero():
+                        LOGGER.info("MLflow metrics logged successfully during training")
+                        LOGGER.info("Skipping mlflow.end_run() in subprocess to prevent hang")
+                        LOGGER.info("Parent Kedro process will finalize MLflow run")
+                    return control
+
+                # Replace the method (binding to instance)
+                callback.on_train_end = safe_on_train_end.__get__(callback, MLflowCallback)
+
+                if is_rank_zero():
+                    LOGGER.info("MLflowCallback.on_train_end() overridden for hang prevention")
+                break
+
+    # CRITICAL: trainer.train() may hang during DeepSpeed cleanup after training completes
+    # We wrap it in try-except to ensure PEFT adapter gets saved even if hang occurs
+    training_completed = False
+    try:
+        trainer.train()
+        training_completed = True
+        LOGGER.info("trainer.train() returned successfully")
+    except KeyboardInterrupt:
+        LOGGER.warning("Training interrupted by user")
+    except Exception as e:
+        LOGGER.error("Training failed with error: %s", e)
+        raise
+
+    # Save final PEFT adapter for inference (avoiding DeepSpeed ZeRO hang)
+    # Training resume will use checkpoint-{last_step}/ which contains full DeepSpeed state
+    output_dir = Path(training_args.output_dir)
+
+    eval_metrics: Dict[str, Any] | None = None
+    if eval_dataset is not None and training_completed:
+        try:
+            eval_metrics = trainer.evaluate()
+            if is_rank_zero():
+                LOGGER.info(
+                    "Evaluation completed: %s",
+                    {k: float(v) if isinstance(v, (int, float)) else v for k, v in eval_metrics.items()}
+                )
+        except Exception as e:
+            LOGGER.warning("Evaluation failed: %s", e)
+
+    # CRITICAL FIX: DeepSpeed ZeRO requires all ranks to participate in save operations
+    # Rank0-only save causes deadlock because:
+    # 1. save_pretrained() may trigger implicit collective operations (all_gather for sharded weights)
+    # 2. Other ranks proceed to barrier while rank0 is stuck in save
+    # 3. Result: NCCL timeout / hang
+    if deepspeed_cfg and torch.distributed.is_initialized():
+        # DeepSpeed path: ALL ranks must call save_pretrained()
+        if is_rank_zero():
+            LOGGER.info("DeepSpeed detected: saving with all-rank participation")
+
+        # Pre-save barrier to ensure all ranks finish evaluation
+        torch.distributed.barrier()
+
+        # Unwrap model (all ranks need same model reference)
+        unwrapped_model = trainer.model
+        if hasattr(unwrapped_model, 'module'):
+            unwrapped_model = unwrapped_model.module
+
+        # ALL ranks call save_pretrained (PEFT internally handles rank0 I/O)
+        unwrapped_model.save_pretrained(
+            output_dir,
+            safe_serialization=True,
+            # PEFT checks this internally, but doesn't cause issues if all ranks call it
+        )
+
+        # Tokenizer save is lightweight, all ranks can call it safely
+        tokenizer.save_pretrained(output_dir)
+
+        # Post-save barrier to ensure save completed before cleanup
+        torch.distributed.barrier()
+
+        if is_rank_zero():
+            LOGGER.info("PEFT adapter saved to %s for inference (all-rank save)", output_dir)
+
+        # Metrics and logging: rank0 only
+        if trainer.is_world_process_zero():
+            metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
+            if eval_metrics is not None:
+                metrics.update(eval_metrics)
+            save_metrics(metrics, metrics_cfg.get("path"))
+            LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
+            LOGGER.info("MLflow artifacts will be logged by Kedro node.")
+    else:
+        # Non-DeepSpeed path: rank0-only save is safe
+        if trainer.is_world_process_zero():
+            # Evaluate and save metrics
+            metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
+            if eval_metrics is not None:
+                metrics.update(eval_metrics)
+            save_metrics(metrics, metrics_cfg.get("path"))
+
+            # Save PEFT adapter only (lightweight, no DeepSpeed sharding issues)
+            unwrapped_model = trainer.model
+            if hasattr(unwrapped_model, 'module'):
+                unwrapped_model = unwrapped_model.module
+
+            unwrapped_model.save_pretrained(
+                output_dir,
+                safe_serialization=True  # Use safetensors format
+            )
+            tokenizer.save_pretrained(output_dir)
+
+            LOGGER.info("PEFT adapter saved to %s for inference", output_dir)
+            LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
+            LOGGER.info("MLflow artifacts will be logged by Kedro node.")
+
+    # Clean up DeepSpeed resources
+    if deepspeed_cfg and torch.distributed.is_initialized():
+        try:
+            torch.distributed.barrier()  # Sync all processes
+            torch.distributed.destroy_process_group()
+            if is_rank_zero():
+                LOGGER.info("DeepSpeed process group destroyed successfully")
+        except Exception as e:
+            if is_rank_zero():
+                LOGGER.warning("Failed to destroy process group: %s", e)
+
+    # Force exit to avoid any remaining cleanup that might hang
+    if is_rank_zero():
+        LOGGER.info("Training script exiting normally")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -23,6 +24,11 @@ import numpy as np
 import yaml
 from datasets import DatasetDict
 from transformers import AutoTokenizer
+
+try:
+    import mlflow
+except ImportError:
+    mlflow = None
 
 logger = logging.getLogger(__name__)
 
@@ -123,13 +129,24 @@ def tokenize_datasets(
                 )
 
     def tokenize_function(examples: Dict[str, Any]) -> Dict[str, Any]:
-        return tokenizer(
+        raw_tokenized = tokenizer(
+            examples["text"],
+            truncation=False,
+            padding=False,
+            add_special_tokens=True,
+        )
+        raw_lengths = [len(ids) for ids in raw_tokenized["input_ids"]]
+
+        tokenized_batch = tokenizer(
             examples["text"],
             truncation=truncation,
             max_length=max_length,
             padding=padding,
             return_length=True,
         )
+
+        tokenized_batch["raw_length"] = raw_lengths
+        return tokenized_batch
 
     logger.info("Tokenizing datasets (padding=%s, truncation=%s)...", padding, truncation)
     tokenized = serialized_datasets.map(
@@ -142,36 +159,48 @@ def tokenize_datasets(
 
     # Token statistics per split
     per_split_stats: Dict[str, Dict[str, float]] = {}
-    all_lengths = []
+    all_lengths: list[np.ndarray] = []
+    all_raw_lengths: list[np.ndarray] = []
     for split_name, split_ds in tokenized.items():
-        lengths = np.array(split_ds["length"])  # return_length output
+        lengths = np.array(split_ds["length"], dtype=np.int64)
+        raw_lengths = np.array(split_ds["raw_length"], dtype=np.int64)
         all_lengths.append(lengths)
+        all_raw_lengths.append(raw_lengths)
         per_split_stats[split_name] = {
             "count": int(lengths.size),
             "mean": float(lengths.mean()),
             "max": int(lengths.max()),
             "min": int(lengths.min()),
             "p95": float(np.percentile(lengths, 95)),
+            "raw_mean": float(raw_lengths.mean()),
+            "raw_max": int(raw_lengths.max()),
+            "raw_min": int(raw_lengths.min()),
+            "raw_p95": float(np.percentile(raw_lengths, 95)),
         }
         logger.info(
-            "%s: count=%s, mean=%.1f, max=%s",
+            "%s: count=%s, mean=%.1f, max=%s (raw mean=%.1f, raw max=%s)",
             split_name,
             per_split_stats[split_name]["count"],
             per_split_stats[split_name]["mean"],
             per_split_stats[split_name]["max"],
+            per_split_stats[split_name]["raw_mean"],
+            per_split_stats[split_name]["raw_max"],
         )
 
     all_lengths = np.concatenate(all_lengths) if all_lengths else np.array([], dtype=np.int64)
+    all_raw_lengths = np.concatenate(all_raw_lengths) if all_raw_lengths else np.array([], dtype=np.int64)
     overall_stats = {
         "count": int(all_lengths.size),
         "mean": float(all_lengths.mean()) if all_lengths.size else 0.0,
         "max": int(all_lengths.max()) if all_lengths.size else 0,
         "min": int(all_lengths.min()) if all_lengths.size else 0,
+        "raw_mean": float(all_raw_lengths.mean()) if all_raw_lengths.size else 0.0,
+        "raw_max": int(all_raw_lengths.max()) if all_raw_lengths.size else 0,
+        "raw_min": int(all_raw_lengths.min()) if all_raw_lengths.size else 0,
     }
     for p in (50, 75, 90, 95, 99):
-        overall_stats[f"p{p}"] = (
-            float(np.percentile(all_lengths, p)) if all_lengths.size else 0.0
-        )
+        overall_stats[f"p{p}"] = float(np.percentile(all_lengths, p)) if all_lengths.size else 0.0
+        overall_stats[f"raw_p{p}"] = float(np.percentile(all_raw_lengths, p)) if all_raw_lengths.size else 0.0
 
     token_length_report = {
         "overall": overall_stats,
@@ -226,6 +255,7 @@ def launch_training(
     lora_defaults = cfg.get("lora_defaults", {})
     deepspeed_cfg = cfg.get("deepspeed", {})
     metrics_cfg = cfg.get("metrics", {})
+    loss_cfg = cfg.get("loss", {})
 
     # Get num_gpus from deepspeed config, fallback to training_script config
     num_gpus = int(deepspeed_cfg.get("num_gpus", script_cfg.get("num_gpus", 1)))
@@ -252,6 +282,7 @@ def launch_training(
             "enable": lora_enable,
             "config": lora_config_dict,
         },
+        "loss": {**loss_cfg},
     }
 
     if deepspeed_cfg.get("config"):
@@ -271,6 +302,16 @@ def launch_training(
             metrics_path = (PROJECT_ROOT / metrics_path).resolve()
         train_config.setdefault("metrics", {})["path"] = str(metrics_path)
         _ensure_dir(metrics_path)
+    class_weight_report = metrics_cfg.get("class_weight_report")
+    if class_weight_report:
+        report_path = Path(class_weight_report)
+        if not report_path.is_absolute():
+            report_path = (PROJECT_ROOT / report_path).resolve()
+        train_config.setdefault("metrics", {})["class_weight_report"] = str(report_path)
+        _ensure_dir(report_path)
+
+    # MLflow reporting enabled - hang prevention handled in training script
+    # by overriding MLflowCallback.on_train_end()
 
     # Write YAML config for the training script
     logger.info("Writing training configuration to %s", config_output_path)
@@ -288,7 +329,84 @@ def launch_training(
     ]
 
     logger.info("Launching DeepSpeed training: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+
+    # Prepare environment variables for subprocess to inherit Kedro MLflow context
+    env = os.environ.copy()
+
+    if mlflow is not None and mlflow.active_run():
+        # Pass Kedro MLflow run context to subprocess via environment variables
+        # Using NESTED run to prevent subprocess from closing parent run
+        active_run = mlflow.active_run()
+        tracking_uri = mlflow.get_tracking_uri()
+
+        env["MLFLOW_TRACKING_URI"] = tracking_uri
+        env["MLFLOW_RUN_ID"] = active_run.info.run_id
+        env["MLFLOW_NESTED_RUN"] = "true"  # Critical: prevents subprocess from closing parent run
+
+        # Optional: pass experiment name for clarity
+        experiment_id = active_run.info.experiment_id
+        try:
+            client = mlflow.tracking.MlflowClient()
+            experiment = client.get_experiment(experiment_id)
+            if experiment:
+                env["MLFLOW_EXPERIMENT_NAME"] = experiment.name
+        except Exception:
+            pass  # Experiment name is optional
+
+        logger.info(
+            "Passing MLflow context to subprocess: tracking_uri=%s, run_id=%s (nested=true)",
+            tracking_uri,
+            active_run.info.run_id,
+        )
+    else:
+        logger.warning(
+            "No active MLflow run found. Subprocess will not log metrics to MLflow."
+        )
+
+    # Stabilize NCCL for single-node ZeRO runs
+    env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    env.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    env.setdefault("NCCL_IB_DISABLE", "1")
+    env.setdefault("NCCL_P2P_DISABLE", "1")
+
+    try:
+        subprocess.run(cmd, env=env, check=True)
+        logger.info("Training subprocess completed successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error("Training subprocess failed with exit code %s", e.returncode)
+        raise
+
+    # Log artifacts to MLflow after training completion
+    if mlflow is not None and mlflow.active_run():
+        try:
+            logger.info("Logging model artifacts to MLflow...")
+
+            # Log final model directory (contains best model after load_best_model_at_end)
+            if output_dir.exists():
+                logger.info("Logging final/best model from %s", output_dir)
+                mlflow.log_artifacts(str(output_dir), artifact_path="final_model")
+
+            # Find and log best checkpoint if trainer_state.json exists
+            trainer_state_path = output_dir / "trainer_state.json"
+            if trainer_state_path.exists():
+                try:
+                    with open(trainer_state_path, "r", encoding="utf-8") as f:
+                        trainer_state = json.load(f)
+
+                    best_checkpoint = trainer_state.get("best_model_checkpoint")
+                    if best_checkpoint:
+                        best_ckpt_path = Path(best_checkpoint)
+                        if best_ckpt_path.exists() and best_ckpt_path != output_dir:
+                            logger.info("Logging best checkpoint from %s", best_ckpt_path)
+                            mlflow.log_artifacts(str(best_ckpt_path), artifact_path="best_checkpoint")
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning("Could not read best checkpoint info from trainer_state.json: %s", e)
+
+            logger.info("Successfully logged models to MLflow artifacts.")
+        except Exception as e:
+            logger.warning("Failed to log models to MLflow: %s", e)
+    else:
+        logger.info("MLflow not available or no active run. Models saved locally only.")
 
     result = {
         "config_path": str(config_output_path),
