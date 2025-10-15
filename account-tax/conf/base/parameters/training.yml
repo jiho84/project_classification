@@ -6,11 +6,11 @@
 split:
   label_column: acct_code
   seed: 42
-  test_size: 0.2
-  val_size: 0.1
+  test_size: 0.05
+  val_size: 0.025
   max_classes: 260
   labelize_num_proc: 16
-  extract_ratio: 0.1  # 1% for fast testing
+  extract_ratio: 1.0  # 1% for fast testing
   extract_seed: 42
   stratify_extract: true
 
@@ -20,7 +20,7 @@ split:
 train:
   serialization:
     text_columns: []
-    separator: "| "
+    separator: "^ "
     key_value_separator: ":"
     include_column_names: true
     num_proc: 16
@@ -37,11 +37,11 @@ train:
   # Default LoRA configuration (anchored for reuse)
   lora_defaults: &lora_cfg
     task_type: "SEQ_CLS"
-    r: 128  # Reduced from 256 for Qwen3-8B memory efficiency
-    lora_alpha: 256  # Reduced from 512 (2x rank)
+    r: 256  # Reduced from 256 for Qwen3-8B memory efficiency
+    lora_alpha: 512  # Reduced from 512 (2x rank)
     lora_dropout: 0.05
-    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-    layers_to_transform: [28, 29, 30, 31, 32, 33, 34, 35]
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
+    layers_to_transform: [25, 26, 27 ,28, 29, 30, 31, 32, 33, 34, 35]
     modules_to_save: ["score"]
     bias: "lora_only"
 
@@ -60,7 +60,7 @@ train:
   training_args:
     output_dir: "data/06_models/checkpoints"
     max_steps: -1  # Disabled: use num_train_epochs instead
-    num_train_epochs: 1  # Full training with 20 epochs
+    num_train_epochs: 20  # Full training with 20 epochs
     per_device_train_batch_size: 8  # Reduced for Qwen3-8B (16→12)
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 4  # Increased to maintain effective batch (2→3)
@@ -68,8 +68,12 @@ train:
     weight_decay: 0.002  # Baseline weight decay
     warmup_ratio: 0.02  # 5% warmup (industry standard for full training)
     lr_scheduler_type: "cosine"
-    eval_strategy: "epoch"  # Evaluate every epoch
-    save_strategy: "epoch"  # Save checkpoint every epoch
+    max_grad_norm: 2.0  # Match DeepSpeed gradient_clipping value
+    eval_strategy: "steps"  # Evaluate every N steps
+    eval_steps: 7500
+    save_strategy: "steps"  # Save checkpoint every N steps
+    save_steps: 7500
+    save_total_limit: 3  # Keep only the latest 3 checkpoints
     logging_steps: 10
     report_to: [mlflow]  # Disable MLflow for faster benchmark
     bf16: true
@@ -85,7 +89,7 @@ train:
     use_class_weights: true
     class_weight_alpha: 0.3
     class_weight_min: 0.2
-    class_weight_max: 8.0
+    class_weight_max: 3.0
 
 
   lora:
@@ -97,7 +101,7 @@ train:
     num_gpus: 4
     config:
       train_micro_batch_size_per_gpu: 8  # Match per_device_train_batch_size
-      train_batch_size: 128  # 16 × 2 (accum) × 4 GPUs
+      train_batch_size: 128  # 8 × 4 (accum) × 4 GPUs
       gradient_accumulation_steps: 4
       zero_optimization:
         stage: 2
@@ -113,7 +117,7 @@ train:
         reduce_bucket_size: 2e8
         overlap_comm: true
         contiguous_gradients: true
-      gradient_clipping: 1.0
+      gradient_clipping: 2.0
       optimizer:
         type: "Adam"  # DeepSpeed will automatically use FusedAdam on GPU
         params:

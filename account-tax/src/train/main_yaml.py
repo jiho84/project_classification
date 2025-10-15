@@ -437,6 +437,8 @@ def main() -> None:
         def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
             super().__init__(*args, **kwargs)
             self.class_weights = class_weights
+            # Fix gradient accumulation loss scaling: Let Trainer handle loss averaging
+            self.model_accepts_loss_kwargs = False
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             labels = inputs.get("labels")
