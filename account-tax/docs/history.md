@@ -807,3 +807,349 @@ deepspeed.config.optimizer.type: "FusedAdam" → "Adam"
 - 다른 모델(Qwen 7B, 14B)로 확장 시 동일한 batch size scaling 원칙 적용
 - Multi-node training 진행 시 Linear Scaling Rule로 LR 계산
 - 새로운 하드웨어(H100, A100) 도입 시 GPU 메모리 활용률 기준으로 batch size 결정
+
+### Session 2025-10-15
+
+| When | Where | Who | Context | Why | How |
+| --- | --- | --- | --- | --- | --- |
+| 2025-10-15T01:00Z | src/train/main_yaml.py / src/account_tax/pipelines/train/nodes.py / conf/base/parameters/training.yml | Developer + Architect | 200시간 학습 시나리오에서 예기치 못한 중단 발생 시 처음부터 재학습해야 하는 위험 | 매일 학습 중단 가능성 존재 → 체크포인트 저장은 되지만 재개 메커니즘 미구현 → 수백 시간 학습 결과 손실 위험 | Transformers Trainer의 `resume_from_checkpoint` 파라미터 활용: training.yml에 resume 설정 추가, nodes.py에서 체크포인트 경로 전달, main_yaml.py에서 재개 로직 구현 → DeepSpeed ZeRO-2 optimizer states 정확히 복원, LR scheduler 연속성 보장, Step 번호 이어서 시작 (checkpoint-50 → Step 51부터) |
+| 2025-10-15T02:00Z | src/train/main_yaml.py:compute_metrics_fn | Developer | 260개 클래스 불균형 데이터에서 accuracy만으로는 소수 클래스 학습 품질 추적 불가 | 기존 메트릭은 accuracy만 제공 → 다수 클래스 정확도에 가려져 희귀 클래스 학습 실패 감지 못 함 | Scikit-learn f1_score 활용해 `f1_weighted`(샘플 수 기반 가중), `f1_macro`(클래스 균등 가중) 추가 → 매 eval_steps마다 MLflow에 자동 기록 → 클래스 불균형 추적 가능, zero_division=0 설정으로 안정성 확보 |
+| 2025-10-15T02:30Z | src/train/main_yaml.py / conf/base/parameters/training.yml | Developer | class_weight_report.json 파일이 매 학습마다 생성되지만 실제 사용처 없음 | Class weights는 손실 함수에서 사용되지만, JSON 보고서는 검토되지 않고 쌓임 → 불필요한 파일 I/O 및 MLflow 로깅 | JSON 파일 저장 로직 제거, MLflow class weight 메트릭 로깅 제거, training.yml의 class_weight_report 파라미터 제거 → Class weights 계산 로직은 유지(손실 함수에 계속 사용) → 코드 간소화, 불필요한 artifact 생성 방지 |
+| 2025-10-15T03:00Z | conf/base/parameters/training.yml | Developer | 200시간 학습 전 체크포인트 저장, 재개, 메트릭 평가 기능을 빠르게 검증하고 싶음 | 전체 데이터로 검증 시 시간 소요 과다 → 기능 오류 발견이 늦어질 위험 | 10분 테스트 설정 적용: extract_ratio=0.01 (1% 데이터), max_steps=150, eval_steps=50, save_steps=50 → checkpoint-50/100/150 생성 확인, 학습 재개(50→150) 테스트, F1 메트릭 기록 검증 → 모든 기능 정상 작동 확인 후 실제 200시간 학습 설정으로 복원 필요 |
+| 2025-10-15T05:20Z | src/train/main_yaml.py / src/account_tax/utils/class_weighting.py | Developer | 클래식 가중치 계산이 main 스크립트에 내장되어 구조적 일관성이 깨지고 재사용이 어려움 | 유지보수성과 테스트 편의성을 높이려면 클래스 가중치 계산을 단일 책임 함수로 분리해야 함 | `build_class_weight_tensor()` 유틸 추가(라벨 기반 역수→알파→캡→평균1), `main_yaml.py`에서 use_class_weights 분기만 두고 함수 호출하도록 단순화 → 가중치 블록 120→25줄 축소, 로깅과 계산 흐름이 Kedro 노드 스타일에 맞게 명확화 |
+
+#### Trainer Checkpoint Resume 인과 체인
+```
+200시간 학습 시나리오 (8일 이상 연속 실행)
+    ↓
+예상 위험:
+    - 전원 중단, 네트워크 장애
+    - 시스템 업데이트, 하드웨어 오류
+    - 매일 학습 중단 가능성 존재
+    ↓
+기존 시스템:
+    - 체크포인트 저장: ✅ (checkpoint-{step}/ 자동 생성)
+    - 학습 재개: ❌ (재개 메커니즘 미구현)
+    ↓
+    중단 발생 시 → 처음부터 재학습 → 수백 시간 손실
+    ↓
+해결책: Transformers resume_from_checkpoint
+    training.yml:
+        resume:
+            enabled: true
+            checkpoint_path: null  # Auto-detect latest
+    ↓
+    nodes.py (launch_training):
+        trainer_args에 resume_from_checkpoint 경로 전달
+    ↓
+    main_yaml.py:
+        Trainer(resume_from_checkpoint=checkpoint_path)
+    ↓
+재개 프로세스:
+    1. checkpoint-{step}/global_step{step}/ 탐색
+    2. DeepSpeed ZeRO-2 optimizer states 로드
+       - bf16_zero_pp_rank_*_optim_states.pt (4 GPU 샤딩)
+    3. Model weights, scheduler, RNG states 복원
+    4. Step 번호 정확히 이어서 시작
+    ↓
+검증 결과:
+    - 초기 학습: 0→150 steps, checkpoint-50/100/150 생성
+    - 재개 학습: checkpoint-50 로드 → Step 51부터 시작 ✅
+    - LR scheduler: Cosine decay 연속 (base LR 재시작 안 함) ✅
+    - DeepSpeed: 4 GPU optimizer states 정확히 복원 ✅
+```
+
+**핵심 설계 결정**:
+- **자동 탐색**: checkpoint_path=null → 최신 checkpoint 자동 감지 (편의성)
+- **명시적 지정**: checkpoint_path 설정 → 특정 checkpoint부터 재개 (제어성)
+- **DeepSpeed 호환**: ZeRO Stage 2 optimizer sharding 완벽 지원
+- **투명성**: Trainer가 자동으로 step 번호, epoch, scheduler 복원
+
+#### F1 메트릭 추가 배경
+```
+260개 클래스 불균형 데이터
+    - 224개 클래스: 샘플 보유
+    - 56개 클래스: Zero-sample
+    ↓
+기존 메트릭: Accuracy만 제공
+    - 다수 클래스 정확도로 전체 accuracy 상승 가능
+    - 소수 클래스 학습 실패해도 감지 어려움
+    ↓
+문제:
+    "Accuracy 80%인데 실제로는 200개 클래스만 학습, 60개 클래스 무시"
+    → 이런 상황을 accuracy 단독으로는 포착 불가
+    ↓
+해결: F1 메트릭 추가
+    f1_weighted: 샘플 수 기반 가중 평균
+        → 다수 클래스 성능 반영 (accuracy와 유사)
+    f1_macro: 클래스 균등 가중 평균
+        → 모든 클래스 동등하게 평가 (소수 클래스 성능 민감)
+    ↓
+구현:
+    from sklearn.metrics import f1_score
+
+    f1_weighted = f1_score(labels, preds, average='weighted', zero_division=0)
+    f1_macro = f1_score(labels, preds, average='macro', zero_division=0)
+
+    return {
+        'accuracy': accuracy,
+        'f1_weighted': f1_weighted,
+        'f1_macro': f1_macro
+    }
+    ↓
+MLflow 자동 로깅:
+    - eval/accuracy, eval/f1_weighted, eval/f1_macro
+    - 매 eval_steps마다 기록
+    - 실험 간 비교 가능
+    ↓
+해석 가이드라인:
+    - f1_macro << f1_weighted: 소수 클래스 학습 실패 신호
+    - f1_macro ≈ f1_weighted: 균형잡힌 학습
+    - accuracy > f1_weighted: 클래스 불균형 심각 (샘플 많은 클래스에 편향)
+```
+
+**Zero-division 처리**:
+- `zero_division=0`: 특정 클래스가 전혀 예측 안 되면 F1=0 (경고 대신)
+- 이유: 학습 초기 단계에서 일부 클래스 예측 안 되는 것은 정상 → warning 대신 조용히 0 처리
+
+#### class_weight_report.json 제거 근거
+```
+Previous Flow:
+    compute_class_weights() 함수
+        ↓ (계산)
+    Class weights dict (260 classes)
+        ↓ (두 갈래)
+    1. 손실 함수에 전달 → CrossEntropyLoss(weight=weights) ✅ 사용됨
+    2. JSON 파일 저장 → class_weight_report.json ❌ 사용 안 됨
+    3. MLflow 메트릭 로깅 → log_metric("class_weights/...") ❌ 확인 안 함
+    ↓
+문제:
+    - JSON 파일: 매 학습마다 생성되지만 검토되지 않음
+    - MLflow 메트릭: 260개 클래스 weight → 차트 과부하, 의미 없음
+    - 실제 사용처: 손실 함수 내부뿐
+    ↓
+해결:
+    Remove:
+        - save_class_weights_report() 함수
+        - mlflow.log_metric("class_weights/...") 로직
+        - training.yml의 class_weight_report 파라미터
+    Keep:
+        - compute_class_weights() 함수 (손실 함수에서 계속 사용)
+        - Alpha dampening 로직 (weight = (total/count)^0.4)
+    ↓
+Benefits:
+    - 불필요한 파일 I/O 제거
+    - MLflow UI 정리 (유용한 메트릭만 표시)
+    - 코드 간소화 (50줄 감소)
+    - 로깅 오버헤드 감소
+```
+
+**설계 원칙**: "로깅은 실제 사용될 때만" → 생성되지만 검토 안 되는 artifact는 노이즈
+
+#### 10분 테스트 설정 전략
+```
+검증 필요 기능:
+    1. Checkpoint 저장 (save_steps=50)
+    2. Evaluation 실행 (eval_steps=50)
+    3. 학습 재개 (resume_from_checkpoint)
+    4. F1 메트릭 기록
+    ↓
+문제:
+    - 전체 데이터로 검증: 시간 소요 과다
+    - 기능 오류 발견 늦어짐
+    ↓
+해결: 10분 테스트 설정
+    extract_ratio: 0.01  # 1% 데이터 샘플링
+    max_steps: 150       # 빠른 종료
+    eval_steps: 50       # 3회 평가 (step 50, 100, 150)
+    save_steps: 50       # 3회 저장
+    ↓
+테스트 시나리오 1 (초기 학습):
+    kedro run --pipeline=train
+    Expected: 0→150 steps, checkpoint-50/100/150 생성
+    Result: ✅ 정상 생성
+    ↓
+테스트 시나리오 2 (학습 재개):
+    checkpoint-150 삭제 → checkpoint-50에서 재개
+    Expected: Step 51부터 시작, LR scheduler 연속
+    Result: ✅ 정상 재개
+    ↓
+테스트 시나리오 3 (메트릭):
+    Expected: accuracy, f1_weighted, f1_macro MLflow 기록
+    Result: ✅ 모두 기록됨
+        - accuracy: 0.326
+        - f1_weighted: 0.240
+        - f1_macro: 0.084
+    ↓
+검증 완료 → 실제 200시간 학습 준비
+    ↓
+복원 필요 설정:
+    extract_ratio: 1.0 (or remove)
+    max_steps: (remove, use num_train_epochs)
+    eval_steps: (원래 값으로, e.g., "epoch")
+    save_steps: (원래 값으로, e.g., "epoch")
+```
+
+**10분 테스트의 가치**:
+- **Risk Reduction**: 기능 오류를 빠르게 발견 → 200시간 학습 중 실패 방지
+- **Iteration Speed**: 설정 변경 → 테스트 → 검증 사이클 가속
+- **Resource Efficiency**: 1% 데이터로도 모든 코드 경로 실행 가능
+
+#### 기술 스택 통합
+```
+Transformers Trainer
+    ↓ (체크포인트 관리)
+Resume from checkpoint: 학습 재개 자동화
+    - Model weights 복원
+    - Optimizer states 복원
+    - Scheduler states 복원
+    - RNG states 복원 (재현성)
+    ↓ (분산 학습)
+DeepSpeed ZeRO Stage 2
+    - Optimizer states를 4 GPU에 샤딩
+    - checkpoint-{step}/global_step{step}/bf16_zero_pp_rank_*_optim_states.pt
+    - 재개 시 샤딩된 states 자동 로드
+    ↓ (실험 추적)
+MLflow
+    - Checkpoint artifacts 자동 업로드
+    - F1 메트릭 자동 로깅
+    - 실험 간 비교 가능
+    ↓ (메트릭 계산)
+Scikit-learn
+    - f1_score(average='weighted')
+    - f1_score(average='macro')
+    - zero_division=0 (안정성)
+```
+
+**통합 효과**: 4개 도구가 seamless하게 협업 → 체크포인트 저장/복원, 메트릭 추적, 분산 학습이 자동화
+
+#### 테스트 결과 상세
+**초기 학습 (0→150 steps)**:
+```
+Checkpoints 생성:
+    - checkpoint-50/global_step50/
+    - checkpoint-100/global_step100/
+    - checkpoint-150/global_step150/
+    각 checkpoint: ~570MB (DeepSpeed sharded states)
+
+Evaluation 결과 (step 150):
+    - eval/accuracy: 0.326
+    - eval/f1_weighted: 0.240
+    - eval/f1_macro: 0.084
+
+해석:
+    - f1_macro (0.084) << f1_weighted (0.240): 소수 클래스 학습 미흡
+    - 정상 현상: 10분 테스트, 1% 데이터 → 충분한 학습 안 됨
+    - 실제 학습에서는 개선 예상
+```
+
+**학습 재개 (50→150 steps)**:
+```
+재개 프로세스:
+    1. checkpoint-50 감지
+    2. "Resuming training from checkpoint-50" 로그
+    3. Step 51부터 시작 (0부터 아님) ✅
+    4. LR: Cosine decay 연속 (base LR 재시작 안 함) ✅
+
+안정성:
+    - DeepSpeed ZeRO-2: 4 GPU optimizer states 정확히 복원
+    - No OOM errors
+    - Metrics 정상 기록
+    - Checkpoints 계속 생성 (checkpoint-100, 150)
+```
+
+#### 200시간 학습 시나리오 대응
+```
+시나리오: 8일간 연속 학습
+    ↓
+예상 중단 사례:
+    1. 매일 오전 9시: 사무실 전원 차단 가능성
+    2. 주말: 시스템 유지보수
+    3. 랜덤: 하드웨어 오류, 네트워크 장애
+    ↓
+대응 전략:
+    - Checkpoint: 매 epoch 또는 N시간마다 저장 (save_steps 설정)
+    - 자동 재개: checkpoint_path=null → 최신 checkpoint 자동 감지
+    - 수동 재개: checkpoint_path="checkpoint-{step}" → 특정 지점부터
+    ↓
+운영 프로토콜:
+    1. 학습 시작: kedro run --pipeline=train
+    2. 중단 발생: Ctrl+C 또는 전원 차단
+    3. 재시작: kedro run --pipeline=train (동일 명령)
+    4. 자동 감지: 최신 checkpoint 로드 후 이어서 학습
+    ↓
+보장 사항:
+    - ✅ Step 번호 연속성 (50→51, 100→101)
+    - ✅ LR scheduler 연속성 (cosine decay 이어짐)
+    - ✅ Optimizer momentum 보존 (Adam states 복원)
+    - ✅ 재현성 (RNG states 복원)
+    - ✅ 손실 없음 (마지막 checkpoint부터 재개)
+```
+
+**Checkpoint 저장 간격 권장**:
+- **High-frequency**: save_steps=500 (1-2시간마다) → 세밀한 재개, 디스크 사용량 높음
+- **Balanced**: save_strategy="epoch" (epoch마다) → 일반적 선택
+- **Low-frequency**: save_steps=5000 (반나절마다) → 디스크 절약, 재개 손실 증가
+
+**이번 프로젝트 선택**: `save_strategy="epoch"` (약 5-10시간 간격 예상)
+
+#### 다음 단계 체크리스트
+**실제 200시간 학습 준비**:
+- [ ] training.yml 설정 복원:
+  - [ ] `extract_ratio: 1.0` (또는 제거)
+  - [ ] `max_steps` 제거 (num_train_epochs 사용)
+  - [ ] `eval_steps` 원래 값으로 (or "epoch")
+  - [ ] `save_steps` 원래 값으로 (or "epoch")
+- [ ] GPU 메모리 모니터링 준비 (nvidia-smi, watch 설정)
+- [ ] MLflow UI 접속 확인 (실시간 메트릭 추적)
+- [ ] Checkpoint 디스크 용량 확인 (~570MB × N checkpoints)
+- [ ] 학습 재개 프로토콜 문서화 (팀 공유)
+
+**모니터링 계획**:
+- **실시간**: nvidia-smi (GPU 사용률, 메모리)
+- **매 epoch**: MLflow UI (accuracy, f1_weighted, f1_macro, loss)
+- **매일**: Checkpoint 디스크 사용량 확인
+- **이상 감지**: f1_macro < 0.1 지속 시 소수 클래스 학습 실패 신호
+
+#### 수정된 파일
+**Configuration**:
+- `/home/user/projects/kedro_project/account-tax/conf/base/parameters/training.yml`
+  - resume.enabled: true, resume.checkpoint_path: null 추가
+  - extract_ratio: 0.01 (10분 테스트용, 실제 학습 시 복원 필요)
+  - max_steps: 150 (10분 테스트용, 실제 학습 시 제거 필요)
+  - eval_steps: 50, save_steps: 50 (10분 테스트용, 실제 학습 시 "epoch"으로 변경)
+  - class_weight_report 파라미터 제거
+
+**Pipeline**:
+- `/home/user/projects/kedro_project/account-tax/src/account_tax/pipelines/train/nodes.py`
+  - launch_training 노드: resume_from_checkpoint 파라미터 전달
+  - class_weight_report 관련 로직 제거
+
+**Training Script**:
+- `/home/user/projects/kedro_project/account-tax/src/train/main_yaml.py`
+  - compute_metrics_fn: f1_weighted, f1_macro 추가
+  - save_class_weights_report 함수 제거
+  - MLflow class weight 로깅 제거
+
+#### 기술적 교훈
+**Checkpoint Resume Best Practices**:
+1. **자동 감지 우선**: checkpoint_path=null로 시작 → 편의성 극대화
+2. **명시적 지정 준비**: 특정 checkpoint로 복귀 필요 시 경로 지정 가능
+3. **DeepSpeed 호환**: ZeRO Stage 2 샤딩과 완벽 호환, 추가 설정 불필요
+4. **투명성**: Trainer가 모든 복원 작업 자동 처리 → 사용자는 신경 안 써도 됨
+
+**Metric Selection Philosophy**:
+1. **Single metric은 불충분**: 불균형 데이터에서 accuracy는 오도 가능
+2. **다각도 평가**: f1_weighted (전체 성능), f1_macro (클래스별 균등 평가)
+3. **산업 표준 준수**: F1 score는 classification에서 사실상 표준 메트릭
+4. **해석 가능성**: Macro vs weighted 차이로 불균형 심각도 즉시 파악
+
+**Testing Strategy**:
+1. **Incremental Validation**: 작은 데이터로 모든 코드 경로 검증 → 위험 감소
+2. **Time-boxed Testing**: 10분 테스트로 빠른 피드백 → 반복 가속
+3. **Production Parity**: 테스트 설정이 프로덕션과 동일한 코드 경로 사용 → 신뢰성 보장
+
+**Code Hygiene**:
+1. **사용 안 되는 코드 제거**: class_weight_report처럼 생성되지만 활용 안 되는 artifact 정리
+2. **로깅 최소화**: 유용한 메트릭만 로깅 → MLflow UI 가독성 향상
+3. **설정 명확화**: 10분 테스트 설정 명시 → 실제 학습 시 복원 필요성 문서화

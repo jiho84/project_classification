@@ -40,6 +40,8 @@ from transformers import (
     set_seed,
 )
 
+from account_tax.utils import build_class_weight_tensor
+
 try:
     import mlflow
 except ImportError:
@@ -61,20 +63,6 @@ except ImportError:  # pragma: no cover - optional dependency guard
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _ensure_dir(path: Path) -> Path:
-    """Create parent directories for the given path and return the path."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _ensure_dirname(path: Path) -> Path:
-    """Create the directory itself (not just parent) and return the path."""
-
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def is_rank_zero() -> bool:
@@ -152,13 +140,6 @@ def save_metrics(metrics: Dict[str, Any], path: str | None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with open(destination, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
-
-
-def compute_accuracy(preds, labels) -> Dict[str, float]:
-    if preds.ndim > 1:
-        preds = preds.argmax(axis=-1)
-    accuracy = (preds == labels).mean().item() if hasattr(preds, "mean") else float((preds == labels).mean())
-    return {"accuracy": float(accuracy)}
 
 
 def main() -> None:
@@ -249,145 +230,23 @@ def main() -> None:
     class_weights_tensor: torch.Tensor | None = None
     if use_class_weights:
         train_labels = np.array(train_dataset["labels"])
-        class_counts = np.bincount(train_labels, minlength=num_labels)
-        # For zero-sample classes, set small default value to avoid division by zero
-        zero_mask = class_counts == 0
-        num_zero_classes = zero_mask.sum()
-        if num_zero_classes > 0:
-            # Set default count as 1% of mean count for non-zero classes, minimum 1
-            non_zero_counts = class_counts[~zero_mask]
-            default_count = max(1.0, non_zero_counts.mean() * 0.01)
-            class_counts = class_counts.astype(np.float32)
-            class_counts[zero_mask] = default_count
-            if is_rank_zero():
-                LOGGER.info("Zero-sample classes: %d/%d (default count: %.2f)", num_zero_classes, num_labels, default_count)
-
-        class_weight_min = loss_cfg.get("class_weight_min", 0.2)
-        class_weight_max = loss_cfg.get("class_weight_max", 8.0)
-        class_weight_min = float(class_weight_min) if class_weight_min is not None else None
-        class_weight_max = float(class_weight_max) if class_weight_max is not None else None
-        if class_weight_min is not None and class_weight_max is not None and class_weight_min > class_weight_max:
-            raise ValueError(
-                f"class_weight_min ({class_weight_min}) must be <= class_weight_max ({class_weight_max})."
-            )
-
-        dummy_value = float(loss_cfg.get("class_weight_dummy_value", 1.0))
-
-        num_classes = len(class_counts)
-        free_mask = ~zero_mask
-        free_count = int(free_mask.sum())
-        free_target = num_classes - dummy_value * num_zero_classes
-        if free_count > 0:
-            if class_weight_min is not None and free_target < class_weight_min * free_count:
-                adjusted = free_target / free_count
-                LOGGER.warning(
-                    "class_weight_min=%.4f is infeasible for %d non-dummy classes (target mean %.4f). "
-                    "Adjusting minimum to %.4f.",
-                    class_weight_min,
-                    free_count,
-                    free_target / free_count if free_count else 0.0,
-                    adjusted,
-                )
-                class_weight_min = adjusted
-            if class_weight_max is not None and free_target > class_weight_max * free_count:
-                adjusted = free_target / free_count
-                LOGGER.warning(
-                    "class_weight_max=%.4f is infeasible for %d non-dummy classes (target mean %.4f). "
-                    "Adjusting maximum to %.4f.",
-                    class_weight_max,
-                    free_count,
-                    free_target / free_count if free_count else 0.0,
-                    adjusted,
-                )
-                class_weight_max = adjusted
-
-        class_weights = (len(train_labels) / (num_labels * class_counts)).astype(np.float64)
-        if class_weight_alpha != 1.0:
-            class_weights = np.power(class_weights, class_weight_alpha, dtype=np.float64)
-
-        free_weights = class_weights[free_mask].copy()
-        target_free_sum = max(0.0, num_classes - dummy_value * num_zero_classes)
-        if free_weights.size > 0:
-            for _ in range(100):
-                current_sum = free_weights.sum()
-                if current_sum <= 0:
-                    fill = target_free_sum / free_weights.size if free_weights.size > 0 else 0.0
-                    free_weights = np.full_like(free_weights, fill)
-                    current_sum = free_weights.sum()
-                scale = target_free_sum / current_sum if current_sum != 0 else 0.0
-                free_weights = free_weights * scale
-                if class_weight_min is not None:
-                    free_weights = np.maximum(free_weights, class_weight_min)
-                if class_weight_max is not None:
-                    free_weights = np.minimum(free_weights, class_weight_max)
-                new_sum = free_weights.sum()
-                if target_free_sum == 0 or abs(new_sum - target_free_sum) <= 1e-6 * max(1.0, target_free_sum):
-                    break
-            # Final rescale to correct residual drift while respecting caps
-            for _ in range(5):
-                free_sum = free_weights.sum()
-                if free_sum <= 0 or target_free_sum == 0:
-                    break
-                free_weights *= target_free_sum / free_sum
-                if class_weight_min is not None:
-                    free_weights = np.maximum(free_weights, class_weight_min)
-                if class_weight_max is not None:
-                    free_weights = np.minimum(free_weights, class_weight_max)
-
-        class_weights = np.full(num_classes, dummy_value, dtype=np.float64)
-        class_weights[free_mask] = free_weights
-        expected_free_sum = num_classes - dummy_value * num_zero_classes
-        if free_count > 0 and expected_free_sum > 0:
-            for _ in range(5):
-                free_sum = class_weights[free_mask].sum()
-                if free_sum <= 0:
-                    break
-                class_weights[free_mask] *= expected_free_sum / free_sum
-                if class_weight_min is not None:
-                    class_weights[free_mask] = np.maximum(class_weights[free_mask], class_weight_min)
-                if class_weight_max is not None:
-                    class_weights[free_mask] = np.minimum(class_weights[free_mask], class_weight_max)
-        class_weights[zero_mask] = dummy_value
-
-        class_weights = class_weights.astype(np.float32)
-        class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
-
-        min_cap_fraction = float(
-            np.mean(np.isclose(class_weights[free_mask], class_weight_min))
-        ) if class_weight_min is not None and free_count > 0 else 0.0
-        max_cap_fraction = float(
-            np.mean(np.isclose(class_weights[free_mask], class_weight_max))
-        ) if class_weight_max is not None and free_count > 0 else 0.0
-
-        report = {
-            "num_labels": int(num_labels),
-            "num_zero_classes": int(num_zero_classes),
-            "dummy_value": float(dummy_value),
-            "alpha": float(class_weight_alpha),
-            "min_config": float(class_weight_min) if class_weight_min is not None else None,
-            "max_config": float(class_weight_max) if class_weight_max is not None else None,
-            "min_weight": float(class_weights.min()),
-            "max_weight": float(class_weights.max()),
-            "mean_weight": float(class_weights.mean()),
-            "median_weight": float(np.median(class_weights)),
-            "p95_weight": float(np.percentile(class_weights, 95)),
-            "p99_weight": float(np.percentile(class_weights, 99)),
-            "cap_min_fraction": min_cap_fraction,
-            "cap_max_fraction": max_cap_fraction,
-        }
+        class_weight_min = float(loss_cfg["class_weight_min"])
+        class_weight_max = float(loss_cfg["class_weight_max"])
+        class_weights_tensor = build_class_weight_tensor(
+            labels=train_labels,
+            num_labels=num_labels,
+            alpha=class_weight_alpha,
+            weight_min=class_weight_min,
+            weight_max=class_weight_max,
+        )
 
         if is_rank_zero():
             LOGGER.info(
-                "Class weights applied (alpha=%.3f, min=%.3f, max=%.3f, dummy=%.3f): non-zero classes=%d, "
-                "weight range=[%.4f, %.4f], mean=%.4f",
+                "Class weights enabled (alpha=%.3f, min=%.3f, max=%.3f, mean=%.4f)",
                 class_weight_alpha,
-                class_weight_min if class_weight_min is not None else float("nan"),
-                class_weight_max if class_weight_max is not None else float("nan"),
-                dummy_value,
-                num_labels - num_zero_classes,
-                report["min_weight"],
-                report["max_weight"],
-                report["mean_weight"],
+                class_weight_min,
+                class_weight_max,
+                float(class_weights_tensor.mean().item()),
             )
 
     else:
