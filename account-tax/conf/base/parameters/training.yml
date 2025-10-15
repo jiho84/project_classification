@@ -10,7 +10,7 @@ split:
   val_size: 0.025
   max_classes: 260
   labelize_num_proc: 16
-  extract_ratio: 1.0  # 1% for fast testing
+  extract_ratio: 0.01  # 1% for 10-minute testing
   extract_seed: 42
   stratify_extract: true
 
@@ -59,8 +59,8 @@ train:
 
   training_args:
     output_dir: "data/06_models/checkpoints"
-    max_steps: -1  # Disabled: use num_train_epochs instead
-    num_train_epochs: 20  # Full training with 20 epochs
+    max_steps: 150  # 10-minute test: 150 steps total
+    num_train_epochs: -1  # Disabled: use max_steps instead
     per_device_train_batch_size: 8  # Reduced for Qwen3-8B (16→12)
     per_device_eval_batch_size: 8
     gradient_accumulation_steps: 4  # Increased to maintain effective batch (2→3)
@@ -70,9 +70,9 @@ train:
     lr_scheduler_type: "cosine"
     max_grad_norm: 2.0  # Match DeepSpeed gradient_clipping value
     eval_strategy: "steps"  # Evaluate every N steps
-    eval_steps: 7500
+    eval_steps: 50  # 10-minute test: eval at step 50, 100, 150
     save_strategy: "steps"  # Save checkpoint every N steps
-    save_steps: 7500
+    save_steps: 50  # 10-minute test: save at step 50, 100
     save_total_limit: 3  # Keep only the latest 3 checkpoints
     logging_steps: 10
     report_to: [mlflow]  # Disable MLflow for faster benchmark
@@ -137,4 +137,7 @@ train:
 
   metrics:
     path: "data/06_models/metrics/train_metrics.json"
-    class_weight_report: "data/06_models/metrics/class_weight_report.json"
+
+  resume:
+    enabled: true
+    checkpoint_path: "data/06_models/checkpoints/checkpoint-50"

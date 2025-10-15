@@ -256,6 +256,7 @@ def launch_training(
     deepspeed_cfg = cfg.get("deepspeed", {})
     metrics_cfg = cfg.get("metrics", {})
     loss_cfg = cfg.get("loss", {})
+    resume_cfg = cfg.get("resume", {})
 
     # Get num_gpus from deepspeed config, fallback to training_script config
     num_gpus = int(deepspeed_cfg.get("num_gpus", script_cfg.get("num_gpus", 1)))
@@ -283,6 +284,7 @@ def launch_training(
             "config": lora_config_dict,
         },
         "loss": {**loss_cfg},
+        "resume": {**resume_cfg},
     }
 
     if deepspeed_cfg.get("config"):
@@ -302,13 +304,6 @@ def launch_training(
             metrics_path = (PROJECT_ROOT / metrics_path).resolve()
         train_config.setdefault("metrics", {})["path"] = str(metrics_path)
         _ensure_dir(metrics_path)
-    class_weight_report = metrics_cfg.get("class_weight_report")
-    if class_weight_report:
-        report_path = Path(class_weight_report)
-        if not report_path.is_absolute():
-            report_path = (PROJECT_ROOT / report_path).resolve()
-        train_config.setdefault("metrics", {})["class_weight_report"] = str(report_path)
-        _ensure_dir(report_path)
 
     # MLflow reporting enabled - hang prevention handled in training script
     # by overriding MLflowCallback.on_train_end()

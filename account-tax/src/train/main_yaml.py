@@ -29,6 +29,7 @@ import torch.nn as nn
 import yaml
 import numpy as np
 from datasets import load_from_disk
+from sklearn.metrics import f1_score
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -174,6 +175,7 @@ def main() -> None:
     deepspeed_cfg = cfg.get("deepspeed")
     lora_cfg = cfg.get("lora", {})
     metrics_cfg = cfg.get("metrics", {})
+    resume_cfg = cfg.get("resume", {})
 
     tokenized_path = data_cfg["tokenized_path"]
     LOGGER.info("Loading tokenized datasets from %s", tokenized_path)
@@ -228,7 +230,17 @@ def main() -> None:
 
     def compute_metrics_fn(eval_pred):
         predictions, labels = eval_pred
-        return compute_accuracy(predictions, labels)
+        preds = predictions.argmax(axis=-1) if predictions.ndim > 1 else predictions
+
+        accuracy = float((preds == labels).mean())
+        f1_weighted = float(f1_score(labels, preds, average='weighted', zero_division=0))
+        f1_macro = float(f1_score(labels, preds, average='macro', zero_division=0))
+
+        return {
+            "accuracy": accuracy,
+            "f1_weighted": f1_weighted,
+            "f1_macro": f1_macro,
+        }
 
     loss_cfg = cfg.get("loss", {})
     use_class_weights = bool(loss_cfg.get("use_class_weights", False))
@@ -378,33 +390,6 @@ def main() -> None:
                 report["mean_weight"],
             )
 
-        if is_rank_zero():
-            report_path = metrics_cfg.get("class_weight_report")
-            if report_path:
-                path_obj = Path(report_path)
-                if not path_obj.is_absolute():
-                    path_obj = (PROJECT_ROOT / path_obj).resolve()
-                _ensure_dir(path_obj)
-                try:
-                    with open(path_obj, "w", encoding="utf-8") as fp:
-                        json.dump({**report, "weights": class_weights.tolist()}, fp, ensure_ascii=False, indent=2)
-                except Exception as exc:
-                    LOGGER.warning("Failed to write class weight report to %s: %s", path_obj, exc)
-
-            if mlflow is not None:
-                try:
-                    active_run = mlflow.active_run()
-                    if active_run is not None:
-                        mlflow.log_metrics(
-                            {
-                                "class_weight_min_actual": report["min_weight"],
-                                "class_weight_max_actual": report["max_weight"],
-                                "class_weight_cap_min_fraction": report["cap_min_fraction"],
-                                "class_weight_cap_max_fraction": report["cap_max_fraction"],
-                            }
-                        )
-                except Exception as exc:
-                    LOGGER.warning("Failed to log class weight metrics to MLflow: %s", exc)
     else:
         if is_rank_zero():
             LOGGER.info("Class weights disabled; using uniform loss.")
@@ -521,7 +506,17 @@ def main() -> None:
     # We wrap it in try-except to ensure PEFT adapter gets saved even if hang occurs
     training_completed = False
     try:
-        trainer.train()
+        # Resume from checkpoint if configured
+        resume_enabled = resume_cfg.get("enabled", False)
+        checkpoint_path = resume_cfg.get("checkpoint_path") if resume_enabled else None
+        if checkpoint_path:
+            if is_rank_zero():
+                LOGGER.info("Resuming training from checkpoint: %s", checkpoint_path)
+        else:
+            if is_rank_zero():
+                LOGGER.info("Starting training from scratch (no checkpoint resume)")
+
+        trainer.train(resume_from_checkpoint=checkpoint_path)
         training_completed = True
         LOGGER.info("trainer.train() returned successfully")
     except KeyboardInterrupt:
