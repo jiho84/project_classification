@@ -78,14 +78,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    if not isinstance(cfg, dict):
-        raise ValueError("Training configuration must be a YAML mapping")
-    return cfg
-
-
 def build_training_arguments(args_cfg: Dict[str, Any], deepspeed_cfg: Dict[str, Any] | None) -> TrainingArguments:
     cfg = dict(args_cfg)
     if deepspeed_cfg:
@@ -145,7 +137,10 @@ def save_metrics(metrics: Dict[str, Any], path: str | None) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
-    cfg = load_config(args.config_yml)
+    with open(args.config_yml, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError("Training configuration must be a YAML mapping")
 
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
@@ -227,20 +222,20 @@ def main() -> None:
     use_class_weights = bool(loss_cfg.get("use_class_weights", False))
     class_weight_alpha = float(loss_cfg.get("class_weight_alpha", 1.0))
 
-    class_weights_tensor: torch.Tensor | None = None
-    if use_class_weights:
-        train_labels = np.array(train_dataset["labels"])
-        class_weight_min = float(loss_cfg["class_weight_min"])
-        class_weight_max = float(loss_cfg["class_weight_max"])
-        class_weights_tensor = build_class_weight_tensor(
-            labels=train_labels,
-            num_labels=num_labels,
-            alpha=class_weight_alpha,
-            weight_min=class_weight_min,
-            weight_max=class_weight_max,
-        )
+    train_labels = np.array(train_dataset["labels"])
+    class_weight_min = float(loss_cfg.get("class_weight_min", 1.0))
+    class_weight_max = float(loss_cfg.get("class_weight_max", 1.0))
+    class_weights_tensor = build_class_weight_tensor(
+        labels=train_labels,
+        num_labels=num_labels,
+        alpha=class_weight_alpha,
+        weight_min=class_weight_min,
+        weight_max=class_weight_max,
+        enabled=use_class_weights,
+    )
 
-        if is_rank_zero():
+    if is_rank_zero():
+        if use_class_weights:
             LOGGER.info(
                 "Class weights enabled (alpha=%.3f, min=%.3f, max=%.3f, mean=%.4f)",
                 class_weight_alpha,
@@ -248,10 +243,8 @@ def main() -> None:
                 class_weight_max,
                 float(class_weights_tensor.mean().item()),
             )
-
-    else:
-        if is_rank_zero():
-            LOGGER.info("Class weights disabled; using uniform loss.")
+        else:
+            LOGGER.info("Class weights disabled; using uniform weights.")
 
     class GPUMemoryCallback(TrainerCallback):
         """Callback to monitor and log GPU memory usage during training."""
@@ -405,77 +398,46 @@ def main() -> None:
     # 1. save_pretrained() may trigger implicit collective operations (all_gather for sharded weights)
     # 2. Other ranks proceed to barrier while rank0 is stuck in save
     # 3. Result: NCCL timeout / hang
-    if deepspeed_cfg and torch.distributed.is_initialized():
-        # DeepSpeed path: ALL ranks must call save_pretrained()
-        if is_rank_zero():
-            LOGGER.info("DeepSpeed detected: saving with all-rank participation")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("DeepSpeed expected but torch.distributed is not initialized")
 
-        # Pre-save barrier to ensure all ranks finish evaluation
+    if is_rank_zero():
+        LOGGER.info("DeepSpeed detected: saving with all-rank participation")
+
+    torch.distributed.barrier()
+
+    unwrapped_model = trainer.model
+    if hasattr(unwrapped_model, 'module'):
+        unwrapped_model = unwrapped_model.module
+
+    unwrapped_model.save_pretrained(
+        output_dir,
+        safe_serialization=True,
+    )
+
+    tokenizer.save_pretrained(output_dir)
+
+    torch.distributed.barrier()
+
+    if is_rank_zero():
+        LOGGER.info("PEFT adapter saved to %s for inference (all-rank save)", output_dir)
+
+    if trainer.is_world_process_zero():
+        metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
+        if eval_metrics is not None:
+            metrics.update(eval_metrics)
+        save_metrics(metrics, metrics_cfg.get("path"))
+        LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
+        LOGGER.info("MLflow artifacts will be logged by Kedro node.")
+
+    try:
         torch.distributed.barrier()
-
-        # Unwrap model (all ranks need same model reference)
-        unwrapped_model = trainer.model
-        if hasattr(unwrapped_model, 'module'):
-            unwrapped_model = unwrapped_model.module
-
-        # ALL ranks call save_pretrained (PEFT internally handles rank0 I/O)
-        unwrapped_model.save_pretrained(
-            output_dir,
-            safe_serialization=True,
-            # PEFT checks this internally, but doesn't cause issues if all ranks call it
-        )
-
-        # Tokenizer save is lightweight, all ranks can call it safely
-        tokenizer.save_pretrained(output_dir)
-
-        # Post-save barrier to ensure save completed before cleanup
-        torch.distributed.barrier()
-
+        torch.distributed.destroy_process_group()
         if is_rank_zero():
-            LOGGER.info("PEFT adapter saved to %s for inference (all-rank save)", output_dir)
-
-        # Metrics and logging: rank0 only
-        if trainer.is_world_process_zero():
-            metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
-            if eval_metrics is not None:
-                metrics.update(eval_metrics)
-            save_metrics(metrics, metrics_cfg.get("path"))
-            LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
-            LOGGER.info("MLflow artifacts will be logged by Kedro node.")
-    else:
-        # Non-DeepSpeed path: rank0-only save is safe
-        if trainer.is_world_process_zero():
-            # Evaluate and save metrics
-            metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
-            if eval_metrics is not None:
-                metrics.update(eval_metrics)
-            save_metrics(metrics, metrics_cfg.get("path"))
-
-            # Save PEFT adapter only (lightweight, no DeepSpeed sharding issues)
-            unwrapped_model = trainer.model
-            if hasattr(unwrapped_model, 'module'):
-                unwrapped_model = unwrapped_model.module
-
-            unwrapped_model.save_pretrained(
-                output_dir,
-                safe_serialization=True  # Use safetensors format
-            )
-            tokenizer.save_pretrained(output_dir)
-
-            LOGGER.info("PEFT adapter saved to %s for inference", output_dir)
-            LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
-            LOGGER.info("MLflow artifacts will be logged by Kedro node.")
-
-    # Clean up DeepSpeed resources
-    if deepspeed_cfg and torch.distributed.is_initialized():
-        try:
-            torch.distributed.barrier()  # Sync all processes
-            torch.distributed.destroy_process_group()
-            if is_rank_zero():
-                LOGGER.info("DeepSpeed process group destroyed successfully")
-        except Exception as e:
-            if is_rank_zero():
-                LOGGER.warning("Failed to destroy process group: %s", e)
+            LOGGER.info("DeepSpeed process group destroyed successfully")
+    except Exception as e:
+        if is_rank_zero():
+            LOGGER.warning("Failed to destroy process group: %s", e)
 
     # Force exit to avoid any remaining cleanup that might hang
     if is_rank_zero():

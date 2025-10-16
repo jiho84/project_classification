@@ -25,6 +25,13 @@ import yaml
 from datasets import DatasetDict
 from transformers import AutoTokenizer
 
+from account_tax.utils import (
+    compose_deepspeed_config,
+    ensure_dir,
+    ensure_dirname,
+    find_project_root,
+)
+
 try:
     import mlflow
 except ImportError:
@@ -33,36 +40,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def _find_project_root() -> Path:
-    """Locate the Kedro project root by searching for pyproject.toml."""
-
-    current = Path(__file__).resolve()
-    for parent in [current, *current.parents]:
-        if (parent / "pyproject.toml").exists():
-            return parent
-    return Path.cwd()
-
-
-PROJECT_ROOT = _find_project_root()
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-
-def _ensure_dir(path: Path) -> Path:
-    """Create parent directories for the given path and return the path."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _ensure_dirname(path: Path) -> Path:
-    """Create the directory itself (not just parent) and return the path."""
-
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+PROJECT_ROOT = find_project_root()
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +190,7 @@ def tokenize_datasets(
         token_length_report["samples"] = samples
 
     # Save tokenized dataset for reuse
-    _ensure_dirname(output_dir)
+    ensure_dirname(output_dir)
     logger.info("Saving tokenized datasets to %s", output_dir)
     tokenized.save_to_disk(str(output_dir))
 
@@ -287,15 +265,16 @@ def launch_training(
         "resume": {**resume_cfg},
     }
 
-    if deepspeed_cfg.get("config"):
-        train_config["deepspeed"] = deepspeed_cfg["config"]
+    ds_config = compose_deepspeed_config(training_args_cfg, deepspeed_cfg, num_gpus)
+    if ds_config:
+        train_config["deepspeed"] = ds_config
 
     # Ensure output dirs exist
-    _ensure_dir(config_output_path)
+    ensure_dir(config_output_path)
     output_dir = Path(train_config["training_args"].get("output_dir", "data/06_models/checkpoints"))
     if not output_dir.is_absolute():
         output_dir = (PROJECT_ROOT / output_dir).resolve()
-    _ensure_dirname(output_dir)
+    ensure_dirname(output_dir)
     train_config["training_args"]["output_dir"] = str(output_dir)
     metrics_path = metrics_cfg.get("path")
     if metrics_path:
@@ -303,7 +282,7 @@ def launch_training(
         if not metrics_path.is_absolute():
             metrics_path = (PROJECT_ROOT / metrics_path).resolve()
         train_config.setdefault("metrics", {})["path"] = str(metrics_path)
-        _ensure_dir(metrics_path)
+        ensure_dir(metrics_path)
 
     # MLflow reporting enabled - hang prevention handled in training script
     # by overriding MLflowCallback.on_train_end()

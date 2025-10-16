@@ -10,8 +10,6 @@
   - 환경 변수 `LOCAL_RANK`가 `"0"`인지 검사해 주 프로세스 여부 판단. 로그 출력 및 저장 작업을 랭크 0으로 제한하는 데 사용.
 - `parse_args() -> argparse.Namespace`  
   - DeepSpeed 런처에서 전달하는 `--config_yml`, `--local_rank`, `--rank`, `--world_size` 인자를 파싱.
-- `load_config(path: str) -> Dict[str, Any]`  
-  - YAML 파일을 로드해 딕셔너리로 반환. 매핑이 아니면 예외 발생.
 - `build_training_arguments(args_cfg: Dict[str, Any], deepspeed_cfg: Dict[str, Any] | None) -> TrainingArguments`  
   - 기본 `training_args`를 DeepSpeed 설정과 병합하고, 필요한 경우 배치 크기·그래디언트 누적 값을 덮어씌움. `report_to` 문자열을 리스트로 변환하고 출력 디렉터리를 생성.
 - `infer_num_labels(dataset) -> int`  
@@ -20,14 +18,14 @@
   - `lora.enable`이 참일 경우 `LoraConfig`를 구성하고 모델을 LoRA로 감쌈. PEFT 미설치 시 예외 발생.
 - `save_metrics(metrics: Dict[str, Any], path: str | None) -> None`  
   - 경로가 주어지면 디렉터리를 만들고 JSON으로 평가 지표를 저장.
-- `build_class_weight_tensor(labels, num_labels, alpha, weight_min, weight_max)` *(utils/class_weighting.py)*  
-  - 훈련 라벨 분포에서 평균 1.0 가중치 텐서를 생성하는 유틸 함수. 역수→지수→클립→정규화 순으로 처리.
+- `build_class_weight_tensor(labels, num_labels, alpha, weight_min, weight_max)` *(utils/common.py)*  
+  - 훈련 라벨 분포에서 평균 1.0 가중치 텐서를 생성하는 유틸 함수. 역수→지수→클립→정규화 순으로 처리하며, 비활성화 시에는 균등 가중치 텐서를 반환.
 - `main() -> None`  
   - 스크립트의 진입점. 아래 세부 흐름과 내부 헬퍼(클로저·내부 클래스)를 모두 포함.
 
 ## main() 내부 흐름
 1. **설정 로딩 및 시드 고정**  
-   - `parse_args()`→`load_config()`로 YAML 구성 로드. `seed`, `model`, `data`, `training_args`, `deepspeed`, `lora`, `metrics`, `resume`, `loss` 섹션을 지역 변수에 분리. `set_seed()` 호출.
+   - `parse_args()`로 경로 인수를 받아 `yaml.safe_load()`로 YAML 구성 로드. `seed`, `model`, `data`, `training_args`, `deepspeed`, `lora`, `metrics`, `resume`, `loss` 섹션을 지역 변수에 분리. `set_seed()` 호출.
 2. **데이터셋 및 토크나이저 준비**  
    - `datasets.load_from_disk`로 토크나이즈된 `DatasetDict` 읽기. 학습·평가 스플릿 선택. 토크나이저 생성 후 패딩 토큰 보정. 라벨 수는 `model.num_labels` 우선, 없으면 `infer_num_labels()` 활용.
 3. **모델 생성 및 LoRA 적용**  
@@ -36,8 +34,8 @@
    - `build_training_arguments()` 호출, DeepSpeed 배치 값 동기화. `DataCollatorWithPadding`을 dtype에 따라 초기화.
 5. **평가 지표 클로저 정의**  
    - `compute_metrics_fn`: argmax 기반 정확도, `f1_weighted`, `f1_macro`를 반환 (`zero_division=0`).
-6. **손실 가중치 계산 (옵션)**  
-   - `loss.use_class_weights`가 참이면 `build_class_weight_tensor()`를 호출해 전체 라벨 분포 기준 가중치 텐서를 생성한 뒤 Trainer에 전달.
+6. **손실 가중치 계산**  
+   - `build_class_weight_tensor()`를 항상 호출해 가중치 텐서를 생성. `use_class_weights`가 꺼져 있으면 균등 가중치 텐서를 반환.
 7. **콜백 및 Trainer 구성**  
    - 내부 클래스 `GPUMemoryCallback` 정의: 랭크 0과 CUDA 사용 시 GPU 메모리 로그를 기록.  
    - 내부 클래스 `WeightedTrainer` 정의: `Trainer` 상속 후 `compute_loss()`에서 클래스 가중치 적용.  
@@ -59,23 +57,9 @@
 - **미사용 헬퍼 존재**: `_ensure_dir`, `_ensure_dirname`, `compute_accuracy` 등 과거 코드 잔재가 남아 있어 책임 경계를 흐림.
 - **교차 관심사 혼재**: 로깅, MLflow 패치, DeepSpeed 동기화, 체크포인트 관리를 한 블록에서 처리하여 추후 확장이 어렵다.
 
-## 손실 가중치 블록 단순화 조사
-- **현재 구현 흐름 요약**
-  1. 라벨 카운트를 `np.bincount`로 계산하고, 등장하지 않은 클래스는 1.0으로 치환해 0 분모를 방지.
-  2. 기본 가중치: `len(train_labels) / (num_labels * class_counts)` 형태로 역수를 스케일링.
-  3. `class_weight_alpha` 적용 시 `np.power`로 감쇠.
-  4. 2중 반복 루프로 `free_weights` 합을 `target_free_sum`(= 전체 클래스 수 - `dummy_value` * 결측 클래스 수)에 맞추기 위해 반복 스케일링.
-  5. 각 루프 단계에서 `class_weight_min`, `class_weight_max` 캡을 적용하고, 캡에 맞물리면 재스케일을 다시 실행.
-  6. 마지막에 전체 벡터를 재구성하고, 추가 루프로 합계가 기대값과 맞는지 몇 차례 더 조정.
-  7. 리포트 딕셔너리를 만들어 로그 출력.
-- **요구사항(역수·알파·캡·평균1)과 비교**
-  - 역수 계산: 이미 수행하지만 중간에 총합 유지 로직 때문에 단순한 수학적 의미가 희석됨.
-  - 알파 적용: 현재 구현은 `np.power`로 지원.
-  - 캡: 반복 루프 내 `np.maximum` / `np.minimum`로 처리되지만, 합을 맞추는 루프와 얽혀 있어 이해가 어려움.
-  - 평균 1 정규화: 현 구현은 `target_free_sum`을 강제해 평균이 1에 근접하도록 하지만, 반복 조정과 dummy 클래스 보정이 섞여 직관성을 잃음.
-- **단순화 후 실제 흐름**
+- **현재 구현 흐름**
   1. `build_class_weight_tensor()`가 라벨 분포를 직접 받아 0 카운트를 1.0으로 치환.
-  2. 역수→지수(alpha)→캡(min/max)→평균 1 정규화 순으로 한 번에 처리하고, `torch.Tensor`를 반환.
+  2. `use_class_weights`가 켜져 있으면 역수→지수(alpha)→캡(min/max)→평균 1 정규화 순으로 처리하고, 꺼져 있으면 균등 가중치를 반환.
 - **단순화 효과**
   - 반복 루프, dummy 값 조정, 통계 리포트를 모두 제거해 블록 길이를 약 70줄에서 25줄 수준으로 축소.
   - 역수→알파→클립→정규화 순서가 코드에 그대로 드러나 직관적이고 테스트하기 쉬움.
