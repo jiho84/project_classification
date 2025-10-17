@@ -262,16 +262,6 @@ def main() -> None:
     output_dir = Path(training_args.output_dir)
 
     eval_metrics: Dict[str, Any] | None = None
-    if eval_dataset is not None and training_completed:
-        try:
-            eval_metrics = trainer.evaluate()
-            LOGGER_ZERO.info(
-                "Evaluation completed: %s",
-                {k: float(v) if isinstance(v, (int, float)) else v for k, v in eval_metrics.items()}
-            )
-        except Exception as e:
-            LOGGER.warning("Evaluation failed: %s", e)
-
     test_metrics: Dict[str, Any] | None = None
     if test_dataset is not None and training_completed:
         try:
@@ -314,7 +304,7 @@ def main() -> None:
         metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
         if eval_metrics is not None:
             metrics.update(eval_metrics)
-        save_metrics(metrics, metrics_cfg.get("path"))
+            save_metrics(metrics, metrics_cfg.get("path"))
         if test_metrics is not None:
             test_payload: Dict[str, Any] = {"global_step": trainer.state.global_step}
             test_payload.update(test_metrics)

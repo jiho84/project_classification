@@ -3,8 +3,8 @@
 - Use this file to record high-level structural decisions.
 - Cross-reference detailed diagrams below; maintain this document as the single source of architectural truth.
 - Whenever pipelines or module boundaries change, summarize the update here and link to supporting docs.
-- **Last Updated**: 2025-09-29
-- **Architecture Version**: 2.0.0
+- **Last Updated**: 2025-10-17
+- **Architecture Version**: 2.1.0
 
 ## 설계 철학 (대칭화 · 모듈화 · 순서화)
 
@@ -12,7 +12,315 @@
 - **모듈화(Modularity)**: 노드 기반으로 기능을 분리하고, 각 모듈이 명확한 입력·출력 계약을 갖도록 유지한다. 파이프라인은 노드 조합만으로 복잡한 동작을 표현해야 한다.
 - **순서화(Ordering)**: 폴더/파일 구조(정적)와 실행 흐름(동적)의 인과를 명확히 기록한다. 문서에는 단계별 순서, 데이터 흐름, 의존 관계를 명시한다.
 
+### Dual-Ecosystem Architecture (이중 생태계 아키텍처)
+
+본 프로젝트는 **Kedro 노드 생태계**와 **서브프로세스 생태계**라는 두 가지 실행 환경을 통합한 이중 구조를 채택합니다.
+
+#### Layer 1: Kedro Node Ecosystem (케드로 노드 생태계)
+- **철학**: 순방향(forward-progressive) 데이터 흐름, 단순 입출력 전달, 블록 단위 조합
+- **제약**: 노드 간 양방향 통신 불가, 복잡한 상태 공유 불가, 단일 실행 스레드
+- **장점**: 재현 가능성, 명확한 의존성, 시각화 가능, MLflow 자동 추적
+- **구현 영역**:
+  - 데이터 전처리 파이프라인 (ingestion → preprocess → feature)
+  - 데이터 분할 및 직렬화 (split)
+  - 토큰화 및 학습 준비 (train → tokenize_datasets)
+
+#### Layer 2: Subprocess Ecosystem (서브프로세스 생태계)
+- **철학**: 복잡한 양방향 상호작용, 멀티프로세스 협업, 동적 상태 관리
+- **특징**: DeepSpeed 분산 학습, GPU 간 통신, 체크포인트 관리, 실시간 메트릭 수집
+- **제약**: Kedro 추적 제한, 수동 MLflow 연동 필요, 서브프로세스 생명주기 관리
+- **구현 영역**:
+  - 분산 학습 실행 (`src/train/main_yaml.py`)
+  - LoRA 최적화, 가중치 업데이트
+  - 체크포인트 저장/복원
+  - 평가 및 메트릭 수집
+
+#### Boundary & Integration (경계 및 통합)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Kedro Node Ecosystem (Layer 1)                                 │
+│                                                                 │
+│  ingestion → preprocess → feature → split → tokenize_datasets  │
+│                                                                 │
+│  [순방향 데이터 흐름, 단순 I/O 전달, 재현 가능성 보장]              │
+└───────────────────────────┬────────────────────────────────────┘
+                            │
+                            ├─ launch_training (Kedro 노드)
+                            │  • YAML 설정 생성
+                            │  • MLflow 컨텍스트 전달 (env vars)
+                            │  • subprocess.run() 호출
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Subprocess Ecosystem (Layer 2)                                 │
+│                                                                 │
+│  main_yaml.py → DeepSpeed 분산 학습                              │
+│  • 양방향 GPU 통신 (NCCL)                                        │
+│  • 동적 체크포인트 관리                                           │
+│  • 실시간 메트릭 수집                                             │
+│  • WeightedTrainer + GPUMemoryCallback                         │
+│                                                                 │
+│  [복잡한 상호작용, 멀티프로세스 협업, 상태 동기화]                   │
+└───────────────────────────┬────────────────────────────────────┘
+                            │
+                            ├─ 학습 완료 후 제어권 반환
+                            │  • 체크포인트 디렉토리 경로
+                            │  • 메트릭 JSON 파일
+                            │  • MLflow 아티팩트 로깅 (Kedro가 수행)
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Kedro Node Ecosystem (Layer 1 복귀)                            │
+│                                                                 │
+│  launch_training → MLflow 아티팩트 로깅 → 파이프라인 종료         │
+└────────────────────────────────────────────────────────────────┘
+```
+
+#### Integration Mechanisms (통합 메커니즘)
+
+1. **Configuration Contract (설정 계약)**
+   - Kedro: `params:train` → YAML 직렬화 → `train_config.yml`
+   - Subprocess: YAML 역직렬화 → 실행 설정 구성
+
+2. **MLflow Context Passing (MLflow 컨텍스트 전달)**
+   ```python
+   # launch_training 노드 (Kedro Layer)
+   env["MLFLOW_TRACKING_URI"] = tracking_uri
+   env["MLFLOW_RUN_ID"] = active_run.info.run_id
+   env["MLFLOW_NESTED_RUN"] = "true"  # 부모 run 보호
+   ```
+
+3. **Artifact Handoff (아티팩트 전달)**
+   - Subprocess → 로컬 디렉토리 저장 (체크포인트, 메트릭)
+   - Kedro 노드 → MLflow 아티팩트 로깅 (제어권 복귀 후)
+
+4. **Error Propagation (에러 전파)**
+   ```python
+   subprocess.run(cmd, env=env, check=True)  # CalledProcessError 발생 시 Kedro 중단
+   ```
+
+#### Design Rationale (설계 근거)
+
+| 요구사항 | Kedro 단독 | Subprocess 통합 | 선택 |
+|---------|-----------|----------------|-----|
+| 분산 학습 (DeepSpeed ZeRO) | ❌ 불가능 | ✅ 네이티브 지원 | **Subprocess** |
+| 재현 가능성 | ✅ 자동 보장 | ⚠️ 수동 관리 | **Kedro** |
+| 복잡한 GPU 통신 | ❌ 불가능 | ✅ NCCL/GLOO | **Subprocess** |
+| 파이프라인 시각화 | ✅ kedro viz | ❌ 불가능 | **Kedro** |
+| 체크포인트 재시작 | ⚠️ 제한적 | ✅ 유연함 | **Subprocess** |
+| MLflow 자동 추적 | ✅ kedro-mlflow | ⚠️ 수동 연동 | **Kedro** |
+
+→ **결론**: 두 생태계의 장점을 결합하여 **데이터 파이프라인은 Kedro**, **학습 실행은 Subprocess**로 분리
+
+#### Common Utilities Bridge (공통 유틸리티 브리지)
+
+`src/account_tax/utils/common.py`는 두 생태계를 연결하는 공통 함수 라이브러리:
+
+```python
+# Kedro 노드에서 사용
+from account_tax.utils import compose_deepspeed_config, ensure_dir
+
+# Subprocess에서 사용
+from account_tax.utils.common import (
+    build_training_arguments,
+    WeightedTrainer,
+    GPUMemoryCallback,
+    compute_classification_metrics,
+)
+```
+
+- **대칭화 원칙**: 동일한 함수 시그니처, 일관된 설정 패턴
+- **모듈화 원칙**: 각 함수는 단일 책임, 명확한 입출력 계약
+- **순서화 원칙**: `common.py` → Kedro 노드 → Subprocess 순서로 임포트
+
+#### Current Implementation Analysis (현재 구현 분석)
+
+##### Kedro Layer Functions (케드로 계층 함수)
+
+**Pattern: Pure Data Transformation (순수 데이터 변환)**
+
+모든 Kedro 노드는 다음 패턴을 따릅니다:
+
+```python
+def node_function(
+    input_data: Type,
+    params: Dict[str, Any]
+) -> OutputType:
+    """
+    Pipeline Order: [파이프라인명] step [번호] ([순서])
+    Role: [역할 설명]
+    """
+    # 1. 입력 검증
+    # 2. 데이터 변환
+    # 3. 로깅 (부수효과)
+    # 4. 출력 반환
+    return transformed_data
+```
+
+**예시: preprocess/nodes.py → clean_data**
+```python
+def clean_data(data: pd.DataFrame, clean_params: Dict[str, Any]) -> pd.DataFrame:
+    initial_rows = len(data)
+
+    # 단순 변환: 중복 제거
+    if clean_params.get('remove_duplicates', True):
+        data = data.drop_duplicates()
+
+    # 단순 변환: null 제거
+    dropna_columns = clean_params.get('dropna_columns', [])
+    if dropna_columns:
+        data = data.dropna(subset=dropna_columns)
+
+    logger.info(f"Cleaning: {initial_rows} -> {len(data)} rows")
+    return data
+```
+
+**특징**:
+- ✅ 상태 없음 (stateless)
+- ✅ 부수효과 최소화 (로깅만)
+- ✅ 테스트 가능
+- ✅ 재현 가능
+- ❌ 복잡한 상호작용 불가능
+
+##### Subprocess Layer Functions (서브프로세스 계층 함수)
+
+**Pattern: Stateful Orchestration (상태 기반 오케스트레이션)**
+
+서브프로세스 함수는 복잡한 상태 관리를 수행:
+
+```python
+def main() -> None:
+    # 1. 설정 로드
+    cfg = yaml.safe_load(open(args.config_yml))
+
+    # 2. 상태 초기화
+    model = load_model(cfg)
+    trainer = create_trainer(model, cfg)
+
+    # 3. 상태 기반 실행
+    trainer.train(resume_from_checkpoint=checkpoint_path)
+
+    # 4. 동적 체크포인트 관리
+    if trainer.state.global_step % save_interval == 0:
+        save_checkpoint(trainer, path)
+
+    # 5. 분산 동기화
+    torch.distributed.barrier()
+
+    # 6. 정리 및 종료
+    destroy_process_group()
+```
+
+**예시: train/main_yaml.py → main**
+```python
+def main() -> None:
+    # 1. 설정 로드 및 시드 고정
+    cfg = yaml.safe_load(open(args.config_yml))
+    set_seed(cfg.get("seed", 42))
+
+    # 2. 데이터셋 로드 (상태)
+    dataset_dict = load_from_disk(cfg["data"]["tokenized_path"])
+
+    # 3. 모델 초기화 (상태)
+    model = AutoModelForSequenceClassification.from_pretrained(...)
+    model = maybe_apply_lora(model, cfg["lora"])
+
+    # 4. 트레이너 생성 (복잡한 상태)
+    trainer = WeightedTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        class_weights=class_weights_tensor,  # 동적 가중치
+        callbacks=[GPUMemoryCallback()],     # 실시간 모니터링
+    )
+
+    # 5. 학습 실행 (양방향 GPU 통신)
+    trainer.train(resume_from_checkpoint=checkpoint_path)
+
+    # 6. 분산 저장 (모든 rank 참여 필요)
+    torch.distributed.barrier()  # 동기화 필수!
+    model.save_pretrained(output_dir)
+    torch.distributed.barrier()
+
+    # 7. 프로세스 그룹 정리
+    torch.distributed.destroy_process_group()
+```
+
+**특징**:
+- ✅ 복잡한 상태 관리
+- ✅ 양방향 통신 (GPU 간)
+- ✅ 동적 체크포인트
+- ✅ 실시간 모니터링
+- ❌ Kedro 추적 불가
+- ❌ 재현성 수동 관리 필요
+
+##### Bridge Node: launch_training (브리지 노드)
+
+**Pattern: Ecosystem Handoff (생태계 전환)**
+
+`launch_training`은 두 생태계를 연결하는 특수 노드:
+
+```python
+def launch_training(
+    tokenized_dataset_path: str,    # Kedro 출력
+    train_params: Dict[str, Any],   # Kedro 파라미터
+) -> Dict[str, Any]:                # Kedro 출력
+    """Kedro → Subprocess 전환 노드"""
+
+    # 1. YAML 설정 직렬화 (Kedro → Subprocess)
+    config_path = write_yaml_config(train_params, tokenized_dataset_path)
+
+    # 2. MLflow 컨텍스트 추출 및 환경변수 전달
+    env = os.environ.copy()
+    if mlflow.active_run():
+        env["MLFLOW_RUN_ID"] = mlflow.active_run().info.run_id
+        env["MLFLOW_NESTED_RUN"] = "true"
+
+    # 3. 서브프로세스 실행 (생태계 전환!)
+    cmd = ["deepspeed", "--num_gpus", str(num_gpus), "src/train/main_yaml.py",
+           "--config_yml", str(config_path)]
+    subprocess.run(cmd, env=env, check=True)
+
+    # 4. 제어권 복귀 후 MLflow 아티팩트 로깅 (Kedro Layer)
+    if mlflow.active_run():
+        mlflow.log_artifacts(output_dir, artifact_path="final_model")
+
+    # 5. Kedro 출력 형식으로 반환
+    return {"config_path": str(config_path), "metrics": load_metrics()}
+```
+
+**특징**:
+- ✅ Kedro 노드 계약 준수 (입력/출력)
+- ✅ Subprocess 실행 및 에러 전파
+- ✅ MLflow 컨텍스트 보존
+- ✅ 아티팩트 생명주기 관리
+- ⚠️ 동기 실행 (블로킹)
+
+##### Function Inventory by Ecosystem (생태계별 함수 목록)
+
+| 함수 위치 | 함수명 | 생태계 | 역할 | 상태 |
+|---------|-------|--------|-----|-----|
+| `pipelines/ingestion/nodes.py` | `load_data` | Kedro | 데이터 로드 | Stateless |
+| `pipelines/preprocess/nodes.py` | `clean_data` | Kedro | 중복/null 제거 | Stateless |
+| `pipelines/feature/nodes.py` | `build_features` | Kedro | 피처 생성 | Stateless |
+| `pipelines/split/nodes.py` | `create_dataset` | Kedro | HF Dataset 변환 | Stateless |
+| `pipelines/train/nodes.py` | `tokenize_datasets` | Kedro | 토큰화 | Stateless |
+| `pipelines/train/nodes.py` | `launch_training` | **Bridge** | 생태계 전환 | Hybrid |
+| `train/main_yaml.py` | `main` | Subprocess | 분산 학습 실행 | Stateful |
+| `utils/common.py` | `WeightedTrainer` | Shared | 가중치 손실 계산 | Stateful |
+| `utils/common.py` | `build_training_arguments` | Shared | TrainingArguments 생성 | Stateless |
+| `utils/common.py` | `GPUMemoryCallback` | Subprocess | GPU 모니터링 | Stateful |
+
 ## Change Log
+
+### 2025-10-17 · Dual-Ecosystem Architecture Documentation v2.1
+- Added comprehensive dual-ecosystem architecture documentation
+- Documented Kedro Layer vs Subprocess Layer design philosophy
+- Analyzed current implementation patterns and function inventory
+- Added integration mechanisms and design rationale
+- Documented bridge node pattern (`launch_training`)
+- Updated architecture version to 2.1.0
 
 ### 2025-09-29 · Architecture Documentation Update v2.0
 - Corrected pipeline structure: 5 main pipelines (ingestion → preprocess → feature → split → train), not 10 stages
@@ -465,25 +773,239 @@ Ingestion → Preprocess → Feature → Split → Train
 - ⚠️ Changes to these parameters affect downstream ClassLabel schema
 - ⚠️ `feature.selection.features` list must match actual DataFrame columns
 
-#### 5. Future Improvements
+#### 5. Architectural Recommendations (아키텍처 권장사항)
 
-##### 5.1 Short-term (Q4 2025)
-- [ ] Complete evaluation pipeline implementation
-- [ ] Integrate or remove unused utility functions
-- [ ] Add data quality monitoring hooks
-- [ ] Implement model versioning strategy
+##### 5.1 Maintaining Design Principles (설계 원칙 유지)
 
-##### 5.2 Medium-term (Q1 2026)
-- [ ] Migrate to Kedro 2.x when stable
-- [ ] Add distributed processing with Spark
-- [ ] Implement A/B testing framework
-- [ ] Add real-time inference pipeline
+**대칭화(Pattern) - 일관성 유지 전략**
 
-##### 5.3 Long-term (2026)
-- [ ] Multi-model ensemble support
-- [ ] AutoML integration
-- [ ] Cloud deployment patterns
-- [ ] CI/CD pipeline automation
+1. **Kedro 노드 템플릿 강제**
+   ```python
+   # 모든 Kedro 노드는 이 템플릿을 따라야 함
+   def {pipeline_name}_{action}(
+       data: InputType,
+       params: Dict[str, Any]
+   ) -> OutputType:
+       """
+       Pipeline Order: {pipeline_name} step {number} ({position})
+       Role: {responsibility_description}
+
+       Args:
+           data: {input_description}
+           params: {param_description}
+
+       Returns:
+           {output_description}
+       """
+       logger.info("Starting {action}...")
+       result = transform(data, params)
+       logger.info("Completed {action}")
+       return result
+   ```
+
+2. **Subprocess 스크립트 템플릿**
+   ```python
+   # 모든 subprocess 스크립트는 main_yaml.py 패턴을 따름
+   def main() -> None:
+       # 1. Parse arguments
+       args = parse_args()
+
+       # 2. Load config
+       cfg = load_config(args.config_yml)
+
+       # 3. Initialize distributed environment
+       setup_distributed()
+
+       # 4. Execute core logic
+       execute(cfg)
+
+       # 5. Cleanup distributed resources
+       cleanup_distributed()
+   ```
+
+**모듈화(Modularity) - 경계 유지 전략**
+
+1. **Kedro 노드 책임 경계**
+   - ✅ 데이터 변환만 수행
+   - ✅ 파라미터로 설정 주입
+   - ✅ 반환값으로만 출력
+   - ❌ 외부 상태 변경 금지
+   - ❌ 파일 시스템 직접 접근 최소화 (Catalog 사용)
+
+2. **Subprocess 책임 경계**
+   - ✅ 복잡한 상태 관리 허용
+   - ✅ 분산 통신 처리
+   - ✅ 동적 체크포인트 관리
+   - ❌ Kedro 데이터 카탈로그 직접 접근 금지
+   - ❌ MLflow 부모 run 변경 금지
+
+3. **Bridge 노드 책임**
+   - ✅ YAML 설정 직렬화
+   - ✅ 환경변수 전달
+   - ✅ 서브프로세스 실행 및 에러 처리
+   - ✅ 아티팩트 후처리 (MLflow 로깅)
+   - ❌ 서브프로세스 내부 로직 포함 금지
+
+**순서화(Ordering) - 흐름 명확화 전략**
+
+1. **파이프라인 순서 문서화**
+   - 모든 노드 독스트링에 "Pipeline Order: {pipeline} step {n}" 명시
+   - `architecture.md`에 전체 흐름 다이어그램 유지
+   - 각 노드의 "후속블록" 명시
+
+2. **생태계 전환 흐름 명확화**
+   ```
+   Kedro Node (tokenize_datasets)
+       ↓ outputs: tokenized_dataset_path
+   Kedro Node (launch_training) ← Bridge
+       ↓ subprocess.run()
+   Subprocess (main_yaml.py)
+       ↓ writes: checkpoints, metrics
+   Kedro Node (launch_training) ← Bridge 복귀
+       ↓ mlflow.log_artifacts()
+   Pipeline 종료
+   ```
+
+##### 5.2 Growth Patterns (확장 패턴)
+
+**새로운 Kedro 파이프라인 추가 시**
+
+1. **기존 패턴 준수**
+   ```
+   pipelines/{new_pipeline}/
+   ├── __init__.py
+   ├── pipeline.py       # create_pipeline() 함수
+   └── nodes.py          # stateless 변환 함수만
+   ```
+
+2. **문서 업데이트 체크리스트**
+   - [ ] `architecture.md`에 새 파이프라인 섹션 추가
+   - [ ] Function Inventory 테이블 업데이트
+   - [ ] 전체 파이프라인 흐름 다이어그램 갱신
+   - [ ] 데이터 계약 문서화 (입력 타입 → 출력 타입)
+
+**새로운 Subprocess 스크립트 추가 시**
+
+1. **main_yaml.py 패턴 복제**
+   ```
+   src/train/
+   ├── main_yaml.py           # 학습 스크립트
+   ├── main_inference.py      # 추론 스크립트 (신규)
+   └── main_evaluation.py     # 평가 스크립트 (신규)
+   ```
+
+2. **Bridge 노드 생성**
+   ```python
+   # pipelines/inference/nodes.py
+   def launch_inference(
+       model_path: str,
+       test_data_path: str,
+       inference_params: Dict[str, Any]
+   ) -> Dict[str, Any]:
+       # launch_training 패턴 복제
+       config_path = write_yaml(inference_params)
+       subprocess.run(["python", "src/train/main_inference.py",
+                      "--config_yml", str(config_path)], check=True)
+       return load_results()
+   ```
+
+**새로운 공통 유틸리티 추가 시**
+
+1. **생태계 분류**
+   - Kedro 전용 → `src/account_tax/utils/kedro_helpers.py`
+   - Subprocess 전용 → `src/account_tax/utils/training_helpers.py`
+   - 공통 → `src/account_tax/utils/common.py`
+
+2. **Stateless vs Stateful 명시**
+   ```python
+   # common.py
+   def stateless_function(input: Type) -> Output:
+       """Pure function for both ecosystems."""
+       return transform(input)
+
+   class StatefulComponent:
+       """For subprocess ecosystem only."""
+       def __init__(self):
+           self.state = {}
+   ```
+
+##### 5.3 Anti-Patterns to Avoid (피해야 할 안티패턴)
+
+1. **❌ Kedro 노드에서 subprocess 직접 실행**
+   ```python
+   # BAD: preprocess/nodes.py
+   def clean_data(data):
+       subprocess.run(["python", "cleanup.py"])  # 금지!
+       return data
+   ```
+   → Bridge 노드로 분리하거나 Kedro 노드로 구현
+
+2. **❌ Subprocess에서 Kedro 카탈로그 직접 접근**
+   ```python
+   # BAD: train/main_yaml.py
+   from kedro.io import DataCatalog
+   catalog = DataCatalog.from_config(...)  # 금지!
+   ```
+   → YAML 설정으로 경로 전달 받기
+
+3. **❌ 상태 공유를 위한 전역 변수**
+   ```python
+   # BAD: utils/common.py
+   GLOBAL_MODEL_STATE = None  # 금지!
+   ```
+   → 명시적 파라미터 전달 또는 파일 시스템 사용
+
+4. **❌ 혼합 생태계 로직**
+   ```python
+   # BAD: 한 함수에서 양쪽 패턴 혼용
+   def hybrid_function(data):
+       # Kedro 스타일 변환
+       result = transform(data)
+       # Subprocess 스타일 상태 관리
+       self.state.update(result)  # 금지!
+       return result
+   ```
+   → 생태계별로 함수 분리
+
+##### 5.4 Future Improvements
+
+**5.4.1 Short-term (Q4 2025)**
+- [ ] Complete evaluation pipeline with subprocess pattern
+- [ ] Add inference pipeline following dual-ecosystem design
+- [ ] Create Kedro node template generator CLI tool
+- [ ] Implement automated architecture validation tests
+
+**5.4.2 Medium-term (Q1 2026)**
+- [ ] Migrate to Kedro 2.x (verify subprocess compatibility)
+- [ ] Add async subprocess execution for parallel experiments
+- [ ] Implement pipeline versioning with ecosystem metadata
+- [ ] Create architecture compliance dashboard
+
+**5.4.3 Long-term (2026)**
+- [ ] Multi-model ensemble with subprocess orchestration
+- [ ] Cloud deployment patterns (Kedro on orchestrator, subprocess on compute)
+- [ ] CI/CD pipeline with dual-ecosystem testing
+- [ ] AutoML integration via bridge nodes
+
+##### 5.5 Ecosystem Migration Checklist (생태계 이전 체크리스트)
+
+**Kedro 노드 → Subprocess 이전 시**
+
+- [ ] 노드 기능이 복잡한 상태 관리 필요?
+- [ ] 분산 처리 또는 멀티프로세스 필요?
+- [ ] 양방향 통신 또는 동적 동기화 필요?
+- [ ] Bridge 노드 패턴으로 전환
+- [ ] `architecture.md` 업데이트
+- [ ] 기존 Kedro 노드 제거 또는 deprecated 마킹
+
+**Subprocess → Kedro 노드 이전 시**
+
+- [ ] 로직이 순수 변환 함수로 단순화 가능?
+- [ ] 상태 관리 불필요?
+- [ ] Kedro 추적 및 시각화 필요?
+- [ ] Stateless 함수로 리팩터링
+- [ ] Kedro 노드로 구현
+- [ ] 기존 subprocess 스크립트 제거
 
 ## MLflow Integration Architecture
 
