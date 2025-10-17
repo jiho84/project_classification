@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable
 
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import Trainer, TrainerCallback
+from transformers import Trainer, TrainerCallback, TrainingArguments
 
 try:
     from peft import LoraConfig, TaskType, get_peft_model
@@ -373,3 +375,557 @@ class WeightedTrainer(Trainer):
         loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
 
         return (loss, outputs) if return_outputs else loss
+
+
+# ==============================================================================
+# Training Pipeline Block Functions (for main_yaml.py subprocess refactoring)
+# ==============================================================================
+
+
+@dataclass
+class TrainingContext:
+    """Immutable training environment and configuration.
+
+    This object is created once at the beginning of the training subprocess
+    and passed through all block functions. It contains all configuration
+    and environment state that doesn't change during training.
+
+    Attributes:
+        cfg: Complete training configuration (from YAML)
+        args: Command-line arguments (from argparse)
+        seed: Random seed for reproducibility
+        is_rank_zero: Whether current process is rank 0
+        output_dir: Directory for saving outputs
+    """
+    cfg: Dict[str, Any]
+    args: argparse.Namespace
+    seed: int
+    is_rank_zero: bool
+    output_dir: Path
+
+
+@dataclass
+class TrainingArtifacts:
+    """Mutable training artifacts passed between block functions.
+
+    This object carries the state that gets built up progressively
+    through the training pipeline. Each block function receives this
+    object and may modify it or return a new version.
+
+    Attributes:
+        train_dataset: Training dataset
+        eval_dataset: Evaluation dataset (optional)
+        test_dataset: Test dataset (optional)
+        num_labels: Number of classification labels
+        tokenizer: HuggingFace tokenizer
+        model: Model instance (with optional LoRA)
+        collator: Data collator for batching
+        training_args: TrainingArguments object
+        class_weights: Class weight tensor for loss
+        trainer: Configured Trainer instance (optional)
+        training_result: Result from trainer.train() (optional)
+    """
+    train_dataset: Any  # datasets.Dataset
+    eval_dataset: Any | None = None
+    test_dataset: Any | None = None
+    num_labels: int = 0
+    tokenizer: Any = None  # transformers.PreTrainedTokenizer
+    model: torch.nn.Module | None = None
+    collator: Any = None  # transformers.DataCollator
+    training_args: TrainingArguments | None = None
+    class_weights: torch.Tensor | None = None
+    trainer: Trainer | None = None
+    training_result: Any = None
+
+
+def setup_training_context(args: argparse.Namespace, cfg: Dict[str, Any]) -> TrainingContext:
+    """Block 1: Initialize training context from args and config.
+
+    This is the first block in the training pipeline. It validates the
+    configuration, sets the random seed, and creates the immutable context
+    object that will be passed to all subsequent blocks.
+
+    Args:
+        args: Parsed command-line arguments
+        cfg: Loaded YAML configuration
+
+    Returns:
+        TrainingContext with initialized environment
+
+    Raises:
+        ValueError: If configuration validation fails
+    """
+    from transformers import set_seed
+
+    if not isinstance(cfg, dict):
+        raise ValueError("Training configuration must be a YAML mapping")
+
+    seed = int(cfg.get("seed", 42))
+    set_seed(seed)
+
+    is_rank_zero = os.environ.get("LOCAL_RANK", "0") == "0"
+    output_dir = Path(cfg.get("training_args", {}).get("output_dir", "./outputs"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return TrainingContext(
+        cfg=cfg,
+        args=args,
+        seed=seed,
+        is_rank_zero=is_rank_zero,
+        output_dir=output_dir,
+    )
+
+
+def load_datasets(
+    context: TrainingContext,
+    logger: logging.Logger,
+) -> TrainingArtifacts:
+    """Block 2: Load tokenized datasets from disk.
+
+    Args:
+        context: Training context with data config
+        logger: Logger instance
+
+    Returns:
+        TrainingArtifacts with train/eval/test datasets
+
+    Raises:
+        FileNotFoundError: If dataset path doesn't exist
+    """
+    from datasets import load_from_disk
+
+    data_cfg = context.cfg.get("data", {})
+    tokenized_path = data_cfg["tokenized_path"]
+
+    logger.info("Loading tokenized datasets from %s", tokenized_path)
+    dataset_dict = load_from_disk(tokenized_path)
+
+    train_split = data_cfg.get("train_split", "train")
+    eval_split = data_cfg.get("eval_split")
+    test_split = data_cfg.get("test_split")
+
+    return TrainingArtifacts(
+        train_dataset=dataset_dict[train_split],
+        eval_dataset=dataset_dict[eval_split] if eval_split and eval_split in dataset_dict else None,
+        test_dataset=dataset_dict[test_split] if test_split and test_split in dataset_dict else None,
+    )
+
+
+def initialize_tokenizer(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger: logging.Logger,
+) -> TrainingArtifacts:
+    """Block 3: Initialize and configure tokenizer.
+
+    Args:
+        context: Training context with model config
+        artifacts: Artifacts with datasets
+        logger: Logger instance
+
+    Returns:
+        Updated artifacts with tokenizer and num_labels
+
+    Raises:
+        ValueError: If tokenizer configuration fails
+    """
+    from transformers import AutoTokenizer
+
+    model_cfg = context.cfg.get("model", {})
+    model_name = model_cfg["name_or_path"]
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=model_cfg.get("trust_remote_code", False)
+    )
+
+    # Handle missing pad_token
+    if tokenizer.pad_token_id is None:
+        eos_token = tokenizer.eos_token
+        if eos_token is None:
+            raise ValueError("Tokenizer is missing both pad and eos tokens; cannot proceed.")
+        pad_token_id = tokenizer.convert_tokens_to_ids(eos_token)
+        if pad_token_id is None:
+            raise ValueError("Unable to determine token id for eos token; cannot reuse for padding.")
+        tokenizer.pad_token = eos_token
+        tokenizer.pad_token_id = pad_token_id
+
+    # Infer num_labels
+    num_labels = model_cfg.get("num_labels")
+    if num_labels is None:
+        num_labels = infer_num_labels(artifacts.train_dataset)
+        logger.info("Inferred num_labels=%s", num_labels)
+
+    artifacts.tokenizer = tokenizer
+    artifacts.num_labels = num_labels
+    return artifacts
+
+
+def initialize_model(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger: logging.Logger,
+) -> TrainingArtifacts:
+    """Block 4: Initialize base model without optimization.
+
+    Loads the pretrained model and configures basic settings.
+    Does not apply any optimization (LoRA, etc).
+
+    Args:
+        context: Training context with model config
+        artifacts: Artifacts with tokenizer and num_labels
+        logger: Logger instance
+
+    Returns:
+        Updated TrainingArtifacts with base model
+    """
+    from transformers import AutoModelForSequenceClassification
+
+    model_cfg = context.cfg.get("model", {})
+
+    # Determine dtype
+    torch_dtype_str = model_cfg.get("torch_dtype", "bfloat16")
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    torch_dtype = dtype_map.get(torch_dtype_str, torch.bfloat16)
+
+    # Load model
+    model_name = model_cfg["name_or_path"]
+    logger.info("Loading model: %s (dtype=%s)", model_name, torch_dtype_str)
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=artifacts.num_labels,
+        dtype=torch_dtype,
+        trust_remote_code=model_cfg.get("trust_remote_code", False),
+    )
+
+    # Configure pad_token
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = artifacts.tokenizer.pad_token_id
+
+    # Gradient checkpointing
+    if model_cfg.get("gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
+
+    artifacts.model = model
+    return artifacts
+
+
+def apply_lora_to_model(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger: logging.Logger,
+) -> TrainingArtifacts:
+    """Block 5: Apply LoRA optimization to model if configured.
+
+    Args:
+        context: Training context with LoRA config
+        artifacts: Artifacts with base model
+        logger: Logger instance
+
+    Returns:
+        Updated artifacts with LoRA-optimized model
+
+    Raises:
+        ImportError: If LoRA is enabled but peft not installed
+    """
+    lora_cfg = context.cfg.get("lora", {})
+
+    artifacts.model = maybe_apply_lora(
+        artifacts.model,
+        lora_cfg,
+        logger=logger,
+        rank_zero_fn=lambda: context.is_rank_zero
+    )
+
+    return artifacts
+
+
+def build_weighted_trainer(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger: logging.Logger,
+    logger_zero: Any,  # RankZeroLogger
+) -> TrainingArtifacts:
+    """Block 6: Build WeightedTrainer with all components.
+
+    Builds TrainingArguments, data collator, class weights, and creates
+    the WeightedTrainer instance with all necessary callbacks.
+
+    Args:
+        context: Training context
+        artifacts: Training artifacts with model, tokenizer, datasets
+        logger: Logger instance
+        logger_zero: Rank-zero logger
+
+    Returns:
+        Updated TrainingArtifacts with configured trainer
+    """
+    from transformers import DataCollatorWithPadding
+
+    training_args_cfg = context.cfg.get("training_args", {})
+    deepspeed_cfg = context.cfg.get("deepspeed", {})
+
+    training_args = build_training_arguments(
+        training_args_cfg,
+        deepspeed_cfg,
+        num_gpus=deepspeed_cfg.get("num_gpus", 4),
+        rank_zero_fn=lambda: context.is_rank_zero,
+    )
+
+    collator = DataCollatorWithPadding(
+        tokenizer=artifacts.tokenizer,
+        pad_to_multiple_of=8 if training_args.bf16 or training_args.fp16 else None,
+    )
+
+    # Build class weights
+    loss_cfg = context.cfg.get("loss", {})
+    use_class_weights = bool(loss_cfg.get("use_class_weights", False))
+    class_weight_alpha = float(loss_cfg.get("class_weight_alpha", 1.0))
+    class_weight_min = float(loss_cfg.get("class_weight_min", 1.0))
+    class_weight_max = float(loss_cfg.get("class_weight_max", 1.0))
+
+    train_labels = np.array(artifacts.train_dataset["labels"])
+    class_weights_tensor = build_class_weight_tensor(
+        labels=train_labels,
+        num_labels=artifacts.num_labels,
+        alpha=class_weight_alpha,
+        weight_min=class_weight_min,
+        weight_max=class_weight_max,
+        enabled=use_class_weights,
+    )
+
+    logger_zero.info(
+        "Class weights configured (alpha=%.3f, min=%.3f, max=%.3f, mean=%.4f)",
+        class_weight_alpha,
+        class_weight_min,
+        class_weight_max,
+        float(class_weights_tensor.mean().item()),
+    )
+
+    # Create callbacks
+    callbacks = []
+    if torch.cuda.is_available():
+        callbacks.append(GPUMemoryCallback(rank_zero_fn=lambda: context.is_rank_zero))
+
+    trainer = WeightedTrainer(
+        model=artifacts.model,
+        args=training_args,
+        train_dataset=artifacts.train_dataset,
+        eval_dataset=artifacts.eval_dataset,
+        processing_class=artifacts.tokenizer,
+        data_collator=collator,
+        class_weights=class_weights_tensor,
+        compute_metrics=compute_classification_metrics if artifacts.eval_dataset is not None else None,
+        callbacks=callbacks,
+    )
+
+    artifacts.collator = collator
+    artifacts.training_args = training_args
+    artifacts.class_weights = class_weights_tensor
+    artifacts.trainer = trainer
+    return artifacts
+
+
+def patch_mlflow_callback(
+    artifacts: TrainingArtifacts,
+    logger_zero: Any,  # RankZeroLogger
+) -> TrainingArtifacts:
+    """Block 7: Override MLflowCallback.on_train_end() to prevent subprocess hang.
+
+    The hang occurs when nested MLflow run tries to finalize and sync with
+    parent process. We skip mlflow.end_run() in subprocess; parent Kedro
+    process will handle run finalization.
+
+    Args:
+        artifacts: Training artifacts with trainer
+        logger_zero: Rank-zero logger
+
+    Returns:
+        Updated artifacts (modifies trainer in-place)
+    """
+    try:
+        from transformers.integrations import MLflowCallback
+    except ImportError:
+        return artifacts  # MLflow not available, nothing to patch
+
+    if MLflowCallback is None:
+        return artifacts
+
+    for callback in artifacts.trainer.callback_handler.callbacks:
+        if isinstance(callback, MLflowCallback):
+            def safe_on_train_end(self, args, state, control, **kwargs):  # noqa: ARG001
+                """Skip mlflow.end_run() that causes hang in subprocess.
+
+                Root cause: mlflow.end_run() tries to:
+                1. Flush metrics to tracking server
+                2. Sync artifacts to storage
+                3. Update run status to FINISHED
+                4. Notify parent run (for nested runs)
+
+                Step 4 causes hang because subprocess cannot communicate
+                with parent process's ThreadLocal MLflow context.
+
+                Solution: Skip end_run() here. Parent Kedro process will
+                handle run finalization after subprocess completes.
+                """
+                logger_zero.info("MLflow metrics logged successfully during training")
+                logger_zero.info("Skipping mlflow.end_run() in subprocess to prevent hang")
+                logger_zero.info("Parent Kedro process will finalize MLflow run")
+                return control
+
+            # Replace the method (binding to instance)
+            callback.on_train_end = safe_on_train_end.__get__(callback, MLflowCallback)
+            logger_zero.info("MLflowCallback.on_train_end() overridden for hang prevention")
+            break
+
+    return artifacts
+
+
+def execute_training_loop(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger: logging.Logger,
+    logger_zero: Any,  # RankZeroLogger
+) -> TrainingArtifacts:
+    """Block 8: Execute training loop with checkpoint resume support.
+
+    Runs trainer.train() with optional checkpoint resume. Handles interrupts
+    and errors gracefully.
+
+    Args:
+        context: Training context
+        artifacts: Training artifacts with configured trainer
+        logger: Logger instance
+        logger_zero: Rank-zero logger
+
+    Returns:
+        Updated TrainingArtifacts with training_result
+
+    Raises:
+        Exception: If training fails (propagates after logging)
+    """
+    resume_cfg = context.cfg.get("resume", {})
+    resume_enabled = resume_cfg.get("enabled", False)
+    checkpoint_path = resume_cfg.get("checkpoint_path") if resume_enabled else None
+
+    if checkpoint_path:
+        logger_zero.info("Resuming training from checkpoint: %s", checkpoint_path)
+    else:
+        logger_zero.info("Starting training from scratch (no checkpoint resume)")
+
+    training_completed = False
+    try:
+        artifacts.trainer.train(resume_from_checkpoint=checkpoint_path)
+        training_completed = True
+        logger.info("trainer.train() returned successfully")
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user")
+    except Exception as e:
+        logger.error("Training failed with error: %s", e)
+        raise
+
+    artifacts.training_result = {"completed": training_completed}
+    return artifacts
+
+
+def evaluate_and_save_results(
+    context: TrainingContext,
+    artifacts: TrainingArtifacts,
+    logger_zero: Any,  # RankZeroLogger
+) -> None:
+    """Block 9: Run test evaluation, save model, and save metrics.
+
+    Evaluates on test set if available, saves the final model (with DeepSpeed
+    all-rank participation), and writes metrics to JSON files.
+
+    Args:
+        context: Training context
+        artifacts: Training artifacts with trained model
+        logger_zero: Rank-zero logger
+
+    Returns:
+        None (saves to disk)
+
+    Raises:
+        RuntimeError: If DeepSpeed is not initialized
+    """
+    training_completed = artifacts.training_result.get("completed", False)
+
+    # Test evaluation
+    eval_metrics: Dict[str, Any] | None = None
+    test_metrics: Dict[str, Any] | None = None
+    if artifacts.test_dataset is not None and training_completed:
+        try:
+            test_metrics = artifacts.trainer.evaluate(
+                eval_dataset=artifacts.test_dataset,
+                metric_key_prefix="test"
+            )
+            logger_zero.info(
+                "Test evaluation completed: %s",
+                {k: float(v) if isinstance(v, (int, float)) else v for k, v in test_metrics.items()}
+            )
+        except Exception as e:
+            logger_zero.warning("Test evaluation failed: %s", e)
+
+    # Save model with DeepSpeed all-rank participation
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("DeepSpeed expected but torch.distributed is not initialized")
+
+    logger_zero.info("DeepSpeed detected: saving with all-rank participation")
+    torch.distributed.barrier()
+
+    unwrapped_model = artifacts.trainer.model
+    if hasattr(unwrapped_model, 'module'):
+        unwrapped_model = unwrapped_model.module
+
+    unwrapped_model.save_pretrained(
+        context.output_dir,
+        safe_serialization=True,
+    )
+    artifacts.tokenizer.save_pretrained(context.output_dir)
+    torch.distributed.barrier()
+
+    logger_zero.info("PEFT adapter saved to %s for inference (all-rank save)", context.output_dir)
+
+    # Save metrics (rank 0 only)
+    if artifacts.trainer.is_world_process_zero():
+        metrics_cfg = context.cfg.get("metrics", {})
+        metrics: Dict[str, Any] = {"global_step": artifacts.trainer.state.global_step}
+        if eval_metrics is not None:
+            metrics.update(eval_metrics)
+            save_metrics(metrics, metrics_cfg.get("path"))
+        if test_metrics is not None:
+            test_payload: Dict[str, Any] = {"global_step": artifacts.trainer.state.global_step}
+            test_payload.update(test_metrics)
+            save_metrics(test_payload, metrics_cfg.get("test_path"))
+
+        logger_zero.info("Training can be resumed from checkpoint-%d/", artifacts.trainer.state.global_step)
+        logger_zero.info("MLflow artifacts will be logged by Kedro node.")
+
+
+def cleanup_distributed_process_group(logger_zero: Any) -> None:
+    """Block 10: Clean up DeepSpeed distributed process group.
+
+    Destroys the process group to release resources. Handles errors gracefully
+    since cleanup may fail in some edge cases.
+
+    Args:
+        logger_zero: Rank-zero logger
+
+    Returns:
+        None
+    """
+    try:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+        logger_zero.info("DeepSpeed process group destroyed successfully")
+    except Exception as e:
+        logger_zero.warning("Failed to destroy process group: %s", e)
+
+    logger_zero.info("Training script exiting normally")
