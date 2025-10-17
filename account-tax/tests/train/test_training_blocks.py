@@ -90,21 +90,19 @@ def test_block_pipeline_structure():
         initialize_model,
         apply_lora_to_model,
         build_weighted_trainer,
-        patch_mlflow_callback,
         execute_training_loop,
         evaluate_and_save_results,
         cleanup_distributed_process_group,
     )
 
-    # Verify all 10 block functions are callable
+    # Verify all 9 block functions are callable
     blocks = [
         setup_training_context,
         load_datasets,
         initialize_tokenizer,
         initialize_model,
         apply_lora_to_model,
-        build_weighted_trainer,
-        patch_mlflow_callback,
+        build_weighted_trainer,  # Now includes MLflow patching internally
         execute_training_loop,
         evaluate_and_save_results,
         cleanup_distributed_process_group,

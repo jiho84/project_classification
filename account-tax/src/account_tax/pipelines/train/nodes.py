@@ -26,7 +26,6 @@ from datasets import DatasetDict
 from transformers import AutoTokenizer
 
 from account_tax.utils import (
-    compose_deepspeed_config,
     ensure_dir,
     ensure_dirname,
     find_project_root,
@@ -265,9 +264,9 @@ def launch_training(
         "resume": {**resume_cfg},
     }
 
-    ds_config = compose_deepspeed_config(training_args_cfg, deepspeed_cfg, num_gpus)
-    if ds_config:
-        train_config["deepspeed"] = ds_config
+    # Pass DeepSpeed config directly to subprocess
+    # build_training_arguments() in subprocess will handle config composition
+    train_config["deepspeed"] = {**deepspeed_cfg}
 
     # Ensure output dirs exist
     ensure_dir(config_output_path)

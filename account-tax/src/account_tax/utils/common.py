@@ -135,55 +135,6 @@ def build_training_arguments(
     return TrainingArguments(**cfg)
 
 
-def compose_deepspeed_config(
-    training_args_cfg: Dict[str, Any],
-    deepspeed_cfg: Dict[str, Any],
-    num_gpus: int,
-) -> Dict[str, Any] | None:
-    """Merge DeepSpeed config with TrainingArguments values to avoid duplication.
-
-    DEPRECATED: Use build_training_arguments() instead for direct TrainingArguments creation.
-    This function is kept for backward compatibility.
-    """
-
-    base_config = deepspeed_cfg.get("config")
-    if not base_config:
-        return None
-
-    ds_config = deepcopy(base_config)
-
-    per_device = int(training_args_cfg.get("per_device_train_batch_size", 1))
-    grad_accum = int(training_args_cfg.get("gradient_accumulation_steps", 1))
-    total_gpus = max(1, int(num_gpus))
-
-    ds_config.setdefault("train_micro_batch_size_per_gpu", per_device)
-    ds_config.setdefault("gradient_accumulation_steps", grad_accum)
-    ds_config.setdefault("train_batch_size", per_device * grad_accum * total_gpus)
-
-    max_grad_norm = training_args_cfg.get("max_grad_norm")
-    if max_grad_norm is not None:
-        ds_config.setdefault("gradient_clipping", max_grad_norm)
-
-    optimizer_cfg = ds_config.setdefault("optimizer", {})
-    optimizer_params = optimizer_cfg.setdefault("params", {})
-    learning_rate = training_args_cfg.get("learning_rate")
-    if learning_rate is not None:
-        optimizer_params.setdefault("lr", learning_rate)
-    weight_decay = training_args_cfg.get("weight_decay")
-    if weight_decay is not None:
-        optimizer_params.setdefault("weight_decay", weight_decay)
-
-    bf16_flag = training_args_cfg.get("bf16")
-    if bf16_flag is not None:
-        ds_config.setdefault("bf16", {})
-        ds_config["bf16"]["enabled"] = bool(bf16_flag)
-
-    fp16_flag = training_args_cfg.get("fp16")
-    if fp16_flag is not None:
-        ds_config.setdefault("fp16", {})
-        ds_config["fp16"]["enabled"] = bool(fp16_flag)
-
-    return ds_config
 
 
 def build_class_weight_tensor(
@@ -652,10 +603,11 @@ def build_weighted_trainer(
     logger: logging.Logger,
     logger_zero: Any,  # RankZeroLogger
 ) -> TrainingArtifacts:
-    """Block 6: Build WeightedTrainer with all components.
+    """Block 6: Build WeightedTrainer with all components and patch MLflow callback.
 
-    Builds TrainingArguments, data collator, class weights, and creates
-    the WeightedTrainer instance with all necessary callbacks.
+    Builds TrainingArguments, data collator, class weights, creates the
+    WeightedTrainer instance with all necessary callbacks, and patches
+    MLflowCallback to prevent subprocess hang.
 
     Args:
         context: Training context
@@ -725,6 +677,9 @@ def build_weighted_trainer(
         callbacks=callbacks,
     )
 
+    # Patch MLflow callback to prevent subprocess hang
+    _patch_mlflow_callback_internal(trainer, logger_zero)
+
     artifacts.collator = collator
     artifacts.training_args = training_args
     artifacts.class_weights = class_weights_tensor
@@ -732,32 +687,28 @@ def build_weighted_trainer(
     return artifacts
 
 
-def patch_mlflow_callback(
-    artifacts: TrainingArtifacts,
-    logger_zero: Any,  # RankZeroLogger
-) -> TrainingArtifacts:
-    """Block 7: Override MLflowCallback.on_train_end() to prevent subprocess hang.
+def _patch_mlflow_callback_internal(trainer: Trainer, logger_zero: Any) -> None:
+    """Internal: Patch MLflowCallback to prevent subprocess hang.
+
+    This is called automatically by build_weighted_trainer().
 
     The hang occurs when nested MLflow run tries to finalize and sync with
     parent process. We skip mlflow.end_run() in subprocess; parent Kedro
     process will handle run finalization.
 
     Args:
-        artifacts: Training artifacts with trainer
+        trainer: Trainer instance to patch
         logger_zero: Rank-zero logger
-
-    Returns:
-        Updated artifacts (modifies trainer in-place)
     """
     try:
         from transformers.integrations import MLflowCallback
     except ImportError:
-        return artifacts  # MLflow not available, nothing to patch
+        return  # MLflow not available, nothing to patch
 
     if MLflowCallback is None:
-        return artifacts
+        return
 
-    for callback in artifacts.trainer.callback_handler.callbacks:
+    for callback in trainer.callback_handler.callbacks:
         if isinstance(callback, MLflowCallback):
             def safe_on_train_end(self, args, state, control, **kwargs):  # noqa: ARG001
                 """Skip mlflow.end_run() that causes hang in subprocess.
@@ -783,8 +734,6 @@ def patch_mlflow_callback(
             callback.on_train_end = safe_on_train_end.__get__(callback, MLflowCallback)
             logger_zero.info("MLflowCallback.on_train_end() overridden for hang prevention")
             break
-
-    return artifacts
 
 
 def execute_training_loop(

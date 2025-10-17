@@ -2,7 +2,6 @@
 
 from .common import (
     build_class_weight_tensor,
-    compose_deepspeed_config,
     ensure_dir,
     ensure_dirname,
     find_project_root,
@@ -11,7 +10,6 @@ from .common import (
 
 __all__ = [
     "build_class_weight_tensor",
-    "compose_deepspeed_config",
     "ensure_dir",
     "ensure_dirname",
     "find_project_root",

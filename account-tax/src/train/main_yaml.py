@@ -32,7 +32,6 @@ from account_tax.utils.common import (
     initialize_model,
     initialize_tokenizer,
     load_datasets,
-    patch_mlflow_callback,
     setup_training_context,
 )
 
@@ -67,11 +66,10 @@ def main() -> None:
         3. initialize_tokenizer       - Configure tokenizer
         4. initialize_model           - Load base model
         5. apply_lora_to_model        - Apply LoRA optimization
-        6. build_weighted_trainer     - Create WeightedTrainer
-        7. patch_mlflow_callback      - Prevent subprocess hang
-        8. execute_training_loop      - Run training
-        9. evaluate_and_save_results  - Evaluate and save
-       10. cleanup_distributed        - Clean up resources
+        6. build_weighted_trainer     - Create WeightedTrainer (includes MLflow patch)
+        7. execute_training_loop      - Run training
+        8. evaluate_and_save_results  - Evaluate and save
+        9. cleanup_distributed        - Clean up resources
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -122,14 +120,7 @@ def main() -> None:
             "inputs": ["context", "artifacts", "logger", "logger_zero"],
             "outputs": "artifacts",
             "name": "build_trainer",
-            "description": "Create WeightedTrainer with all components",
-        },
-        {
-            "func": patch_mlflow_callback,
-            "inputs": ["artifacts", "logger_zero"],
-            "outputs": "artifacts",
-            "name": "patch_mlflow",
-            "description": "Override MLflow callback to prevent hang",
+            "description": "Create WeightedTrainer and patch MLflow callback",
         },
         {
             "func": execute_training_loop,
