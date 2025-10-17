@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
-import torch.nn as nn
 import yaml
 import numpy as np
 from datasets import load_from_disk
@@ -34,13 +33,20 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
-    Trainer,
     TrainingArguments,
-    TrainerCallback,
     set_seed,
 )
 
-from account_tax.utils import build_class_weight_tensor
+from account_tax.utils import RankZeroLogger, build_class_weight_tensor
+from account_tax.utils.common import (
+    GPUMemoryCallback,
+    WeightedTrainer,
+    build_training_arguments,
+    compute_classification_metrics,
+    infer_num_labels,
+    maybe_apply_lora,
+    save_metrics,
+)
 
 try:
     import mlflow
@@ -53,20 +59,13 @@ except ImportError:
     MLflowCallback = None
 from transformers.trainer_utils import get_last_checkpoint
 
-try:
-    from peft import LoraConfig, get_peft_model
-    from peft import TaskType  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency guard
-    LoraConfig = None
-    get_peft_model = None
-    TaskType = None
-
-
-LOGGER = logging.getLogger(__name__)
-
 
 def is_rank_zero() -> bool:
     return os.environ.get("LOCAL_RANK", "0") == "0"
+
+
+LOGGER = logging.getLogger(__name__)
+LOGGER_ZERO = RankZeroLogger(LOGGER, is_rank_zero)
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,62 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
     return parser.parse_args()
-
-
-def build_training_arguments(args_cfg: Dict[str, Any], deepspeed_cfg: Dict[str, Any] | None) -> TrainingArguments:
-    cfg = dict(args_cfg)
-    if deepspeed_cfg:
-        cfg["deepspeed"] = deepspeed_cfg
-        # Override TrainingArguments with DeepSpeed config values to avoid mismatch errors
-        if "train_micro_batch_size_per_gpu" in deepspeed_cfg:
-            cfg["per_device_train_batch_size"] = deepspeed_cfg["train_micro_batch_size_per_gpu"]
-        if is_rank_zero():
-            LOGGER.info("DeepSpeed override: per_device_train_batch_size = %s", deepspeed_cfg["train_micro_batch_size_per_gpu"])
-        if "gradient_accumulation_steps" in deepspeed_cfg:
-            cfg["gradient_accumulation_steps"] = deepspeed_cfg["gradient_accumulation_steps"]
-            if is_rank_zero():
-                LOGGER.info("DeepSpeed override: gradient_accumulation_steps = %s", deepspeed_cfg["gradient_accumulation_steps"])
-    # Trainer expects lists for report_to, etc.
-    if "report_to" in cfg and isinstance(cfg["report_to"], str):
-        cfg["report_to"] = [cfg["report_to"]]
-    output_dir = Path(cfg.get("output_dir", "./outputs"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return TrainingArguments(**cfg)
-
-
-def infer_num_labels(dataset) -> int:
-    if "labels" in dataset.features:
-        feature = dataset.features["labels"]
-        # SequenceClassification: ClassLabel
-        if hasattr(feature, "num_classes"):
-            return feature.num_classes
-    return len(set(dataset["labels"]))
-
-
-def maybe_apply_lora(model, lora_section: Dict[str, Any]) -> torch.nn.Module:
-    if not lora_section.get("enable", False):
-        return model
-    if LoraConfig is None or get_peft_model is None:
-        raise ImportError("peft package is required for LoRA but is not installed")
-
-    cfg = dict(lora_section.get("config", {}))
-    task_type = cfg.pop("task_type", "SEQ_CLS")
-    if TaskType is not None and isinstance(task_type, str):
-        task_type_enum = TaskType[task_type]
-        cfg["task_type"] = task_type_enum
-
-    lora_cfg = LoraConfig(**cfg)
-    LOGGER.info("Applying LoRA with config: %s", cfg)
-    return get_peft_model(model, lora_cfg)
-
-
-def save_metrics(metrics: Dict[str, Any], path: str | None) -> None:
-    if not path:
-        return
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with open(destination, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
 
 
 def main() -> None:
@@ -162,11 +105,20 @@ def main() -> None:
 
     train_dataset = dataset_dict[train_split]
     eval_dataset = dataset_dict[eval_split] if eval_split and eval_split in dataset_dict else None
+    test_split = data_cfg.get("test_split")
+    test_dataset = dataset_dict[test_split] if test_split and test_split in dataset_dict else None
 
     model_name = model_cfg["name_or_path"]
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=model_cfg.get("trust_remote_code", False))
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        eos_token = tokenizer.eos_token
+        if eos_token is None:
+            raise ValueError("Tokenizer is missing both pad and eos tokens; cannot proceed.")
+        pad_token_id = tokenizer.convert_tokens_to_ids(eos_token)
+        if pad_token_id is None:
+            raise ValueError("Unable to determine token id for eos token; cannot reuse for padding.")
+        tokenizer.pad_token = eos_token
+        tokenizer.pad_token_id = pad_token_id
 
     num_labels = model_cfg.get("num_labels")
     if num_labels is None:
@@ -195,28 +147,19 @@ def main() -> None:
     if model_cfg.get("gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
 
-    model = maybe_apply_lora(model, lora_cfg)
+    model = maybe_apply_lora(model, lora_cfg, logger=LOGGER, rank_zero_fn=is_rank_zero)
 
-    training_args = build_training_arguments(training_args_cfg, deepspeed_cfg)
+    training_args = build_training_arguments(
+        training_args_cfg,
+        deepspeed_cfg,
+        num_gpus=deepspeed_cfg.get("num_gpus", 4),
+        rank_zero_fn=is_rank_zero
+    )
 
     collator = DataCollatorWithPadding(
         tokenizer=tokenizer,
         pad_to_multiple_of=8 if training_args.bf16 or training_args.fp16 else None,
     )
-
-    def compute_metrics_fn(eval_pred):
-        predictions, labels = eval_pred
-        preds = predictions.argmax(axis=-1) if predictions.ndim > 1 else predictions
-
-        accuracy = float((preds == labels).mean())
-        f1_weighted = float(f1_score(labels, preds, average='weighted', zero_division=0))
-        f1_macro = float(f1_score(labels, preds, average='macro', zero_division=0))
-
-        return {
-            "accuracy": accuracy,
-            "f1_weighted": f1_weighted,
-            "f1_macro": f1_macro,
-        }
 
     loss_cfg = cfg.get("loss", {})
     use_class_weights = bool(loss_cfg.get("use_class_weights", False))
@@ -234,77 +177,18 @@ def main() -> None:
         enabled=use_class_weights,
     )
 
-    if is_rank_zero():
-        if use_class_weights:
-            LOGGER.info(
-                "Class weights enabled (alpha=%.3f, min=%.3f, max=%.3f, mean=%.4f)",
-                class_weight_alpha,
-                class_weight_min,
-                class_weight_max,
-                float(class_weights_tensor.mean().item()),
-            )
-        else:
-            LOGGER.info("Class weights disabled; using uniform weights.")
-
-    class GPUMemoryCallback(TrainerCallback):
-        """Callback to monitor and log GPU memory usage during training."""
-
-        def __init__(self):
-            self.enabled = is_rank_zero() and torch.cuda.is_available()
-            self.gpu_count = torch.cuda.device_count() if self.enabled else 0
-            self.device_props = []
-            if self.enabled and self.gpu_count > 0:
-                props = torch.cuda.get_device_properties(0)
-                self.device_props.append(props)
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            """Add GPU memory usage to logs."""
-            if not self.enabled or logs is None or self.gpu_count == 0:
-                return
-
-            allocated = torch.cuda.memory_allocated(0) / 1024**3
-            reserved = torch.cuda.memory_reserved(0) / 1024**3
-            total = self.device_props[0].total_memory / 1024**3
-            percent = (allocated / total) * 100 if total > 0 else 0
-
-            logs["gpu_mem"] = f"{allocated:.1f}GB/{total:.0f}GB ({percent:.0f}%)"
-            logs["gpu_reserved"] = f"{reserved:.1f}GB"
-
-    class WeightedTrainer(Trainer):
-        def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.class_weights = class_weights
-            # Fix gradient accumulation loss scaling: Let Trainer handle loss averaging
-            self.model_accepts_loss_kwargs = False
-
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-            labels = inputs.get("labels")
-
-            if labels is None or self.class_weights is None:
-                # Fallback to default loss
-                return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
-
-            # Remove labels to prevent model from computing loss internally
-            inputs = dict(inputs)
-            labels = inputs.pop("labels")
-
-            # Forward pass without labels
-            outputs = model(**inputs)
-            logits = outputs.logits
-
-            # Custom weighted loss with ignore_index=-100
-            loss_fct = nn.CrossEntropyLoss(
-                weight=self.class_weights.to(logits.device, dtype=logits.dtype),
-                ignore_index=-100  # Important: ignore padding tokens!
-            )
-            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
-
-            return (loss, outputs) if return_outputs else loss
+    LOGGER_ZERO.info(
+        "Class weights configured (alpha=%.3f, min=%.3f, max=%.3f, mean=%.4f)",
+        class_weight_alpha,
+        class_weight_min,
+        class_weight_max,
+        float(class_weights_tensor.mean().item()),
+    )
 
     # Create callbacks
     callbacks = []
     if torch.cuda.is_available():
-        callbacks.append(GPUMemoryCallback())
+        callbacks.append(GPUMemoryCallback(rank_zero_fn=is_rank_zero))
     # Note: Regular step-based checkpoints (save_steps=100) work fine with DeepSpeed
     # Epoch-end saves caused NCCL hangs, so we rely on step-based checkpoints + final PEFT save
 
@@ -313,10 +197,10 @@ def main() -> None:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=collator,
         class_weights=class_weights_tensor,
-        compute_metrics=compute_metrics_fn if eval_dataset is not None else None,
+        compute_metrics=compute_classification_metrics if eval_dataset is not None else None,
         callbacks=callbacks,
     )
 
@@ -341,17 +225,15 @@ def main() -> None:
                     Solution: Skip end_run() here. Parent Kedro process will
                     handle run finalization after subprocess completes.
                     """
-                    if is_rank_zero():
-                        LOGGER.info("MLflow metrics logged successfully during training")
-                        LOGGER.info("Skipping mlflow.end_run() in subprocess to prevent hang")
-                        LOGGER.info("Parent Kedro process will finalize MLflow run")
+                    LOGGER_ZERO.info("MLflow metrics logged successfully during training")
+                    LOGGER_ZERO.info("Skipping mlflow.end_run() in subprocess to prevent hang")
+                    LOGGER_ZERO.info("Parent Kedro process will finalize MLflow run")
                     return control
 
                 # Replace the method (binding to instance)
                 callback.on_train_end = safe_on_train_end.__get__(callback, MLflowCallback)
 
-                if is_rank_zero():
-                    LOGGER.info("MLflowCallback.on_train_end() overridden for hang prevention")
+                LOGGER_ZERO.info("MLflowCallback.on_train_end() overridden for hang prevention")
                 break
 
     # CRITICAL: trainer.train() may hang during DeepSpeed cleanup after training completes
@@ -362,11 +244,9 @@ def main() -> None:
         resume_enabled = resume_cfg.get("enabled", False)
         checkpoint_path = resume_cfg.get("checkpoint_path") if resume_enabled else None
         if checkpoint_path:
-            if is_rank_zero():
-                LOGGER.info("Resuming training from checkpoint: %s", checkpoint_path)
+            LOGGER_ZERO.info("Resuming training from checkpoint: %s", checkpoint_path)
         else:
-            if is_rank_zero():
-                LOGGER.info("Starting training from scratch (no checkpoint resume)")
+            LOGGER_ZERO.info("Starting training from scratch (no checkpoint resume)")
 
         trainer.train(resume_from_checkpoint=checkpoint_path)
         training_completed = True
@@ -385,13 +265,23 @@ def main() -> None:
     if eval_dataset is not None and training_completed:
         try:
             eval_metrics = trainer.evaluate()
-            if is_rank_zero():
-                LOGGER.info(
-                    "Evaluation completed: %s",
-                    {k: float(v) if isinstance(v, (int, float)) else v for k, v in eval_metrics.items()}
-                )
+            LOGGER_ZERO.info(
+                "Evaluation completed: %s",
+                {k: float(v) if isinstance(v, (int, float)) else v for k, v in eval_metrics.items()}
+            )
         except Exception as e:
             LOGGER.warning("Evaluation failed: %s", e)
+
+    test_metrics: Dict[str, Any] | None = None
+    if test_dataset is not None and training_completed:
+        try:
+            test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+            LOGGER_ZERO.info(
+                "Test evaluation completed: %s",
+                {k: float(v) if isinstance(v, (int, float)) else v for k, v in test_metrics.items()}
+            )
+        except Exception as e:
+            LOGGER.warning("Test evaluation failed: %s", e)
 
     # CRITICAL FIX: DeepSpeed ZeRO requires all ranks to participate in save operations
     # Rank0-only save causes deadlock because:
@@ -401,8 +291,7 @@ def main() -> None:
     if not torch.distributed.is_initialized():
         raise RuntimeError("DeepSpeed expected but torch.distributed is not initialized")
 
-    if is_rank_zero():
-        LOGGER.info("DeepSpeed detected: saving with all-rank participation")
+    LOGGER_ZERO.info("DeepSpeed detected: saving with all-rank participation")
 
     torch.distributed.barrier()
 
@@ -419,29 +308,29 @@ def main() -> None:
 
     torch.distributed.barrier()
 
-    if is_rank_zero():
-        LOGGER.info("PEFT adapter saved to %s for inference (all-rank save)", output_dir)
+    LOGGER_ZERO.info("PEFT adapter saved to %s for inference (all-rank save)", output_dir)
 
     if trainer.is_world_process_zero():
         metrics: Dict[str, Any] = {"global_step": trainer.state.global_step}
         if eval_metrics is not None:
             metrics.update(eval_metrics)
         save_metrics(metrics, metrics_cfg.get("path"))
-        LOGGER.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
-        LOGGER.info("MLflow artifacts will be logged by Kedro node.")
+        if test_metrics is not None:
+            test_payload: Dict[str, Any] = {"global_step": trainer.state.global_step}
+            test_payload.update(test_metrics)
+            save_metrics(test_payload, metrics_cfg.get("test_path"))
+        LOGGER_ZERO.info("Training can be resumed from checkpoint-%d/", trainer.state.global_step)
+        LOGGER_ZERO.info("MLflow artifacts will be logged by Kedro node.")
 
     try:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()
-        if is_rank_zero():
-            LOGGER.info("DeepSpeed process group destroyed successfully")
+        LOGGER_ZERO.info("DeepSpeed process group destroyed successfully")
     except Exception as e:
-        if is_rank_zero():
-            LOGGER.warning("Failed to destroy process group: %s", e)
+        LOGGER_ZERO.warning("Failed to destroy process group: %s", e)
 
     # Force exit to avoid any remaining cleanup that might hang
-    if is_rank_zero():
-        LOGGER.info("Training script exiting normally")
+    LOGGER_ZERO.info("Training script exiting normally")
 
 
 if __name__ == "__main__":
