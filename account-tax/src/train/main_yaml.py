@@ -89,28 +89,28 @@ def main() -> None:
         },
         {
             "func": load_datasets,
-            "inputs": ["context", "logger"],
+            "inputs": ["context", "logger_zero"],
             "outputs": "artifacts",
             "name": "load_datasets",
             "description": "Load tokenized datasets",
         },
         {
             "func": initialize_tokenizer,
-            "inputs": ["context", "artifacts", "logger"],
+            "inputs": ["context", "artifacts", "logger_zero"],
             "outputs": "artifacts",
             "name": "initialize_tokenizer",
             "description": "Configure tokenizer and infer num_labels",
         },
         {
             "func": initialize_model,
-            "inputs": ["context", "artifacts", "logger"],
+            "inputs": ["context", "artifacts", "logger_zero"],
             "outputs": "artifacts",
             "name": "initialize_model",
             "description": "Load base model without optimization",
         },
         {
             "func": apply_lora_to_model,
-            "inputs": ["context", "artifacts", "logger"],
+            "inputs": ["context", "artifacts", "logger_zero"],
             "outputs": "artifacts",
             "name": "apply_lora",
             "description": "Apply LoRA optimization if configured",
@@ -154,7 +154,7 @@ def main() -> None:
     }
 
     for block in pipeline:
-        LOGGER.info(f"Executing block [{block['name']}]: {block['description']}")
+        LOGGER_ZERO.info(f"Executing block [{block['name']}]: {block['description']}")
 
         # Resolve inputs from state
         inputs = [state[inp] for inp in block["inputs"]]
