@@ -1132,6 +1132,209 @@ Evaluation 결과 (step 150):
   - save_class_weights_report 함수 제거
   - MLflow class weight 로깅 제거
 
+### Session 2025-10-20
+
+| When | Where | Who | Context | Why | How |
+| --- | --- | --- | --- | --- | --- |
+| 2025-10-20T00:00Z | src/account_tax/utils/common.py:553 | Developer + Historian | Python 3.12 환경 재구성 후 학습 파이프라인 실행 시 `TypeError: Qwen3ForSequenceClassification.__init__() got an unexpected keyword argument 'dtype'` 발생 | 모델 초기화 코드에서 `dtype=torch_dtype` 파라미터 사용 → transformers 4.52.3에서는 `dtype`를 인식하지 못하고 `torch_dtype`만 허용 → 원래부터 존재하던 잠재 버그 | 근본 원인 조사를 통해 `dtype` vs `torch_dtype` 차이 규명: `from_pretrained()`는 Line 236에서 `torch_dtype`를 pop하여 직접 처리하지만 `dtype`는 인식하지 못해 `__init__()`로 전달됨 → `Qwen3ForSequenceClassification.__init__(config)`는 `dtype` 파라미터를 받지 않으므로 TypeError 발생 → `dtype=torch_dtype` → `torch_dtype=torch_dtype` 수정으로 해결 |
+
+#### dtype vs torch_dtype 버그 발견 인과 체인
+```
+Python 3.12 환경 재구성 완료
+    ↓
+kedro run --pipeline=training 실행
+    ↓
+모델 초기화 단계 (initialize_model 함수)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=artifacts.num_labels,
+        dtype=torch_dtype,  # ← BUG: 잘못된 파라미터 이름
+        trust_remote_code=True,
+    )
+    ↓
+TypeError 발생:
+    "Qwen3ForSequenceClassification.__init__() got an unexpected
+     keyword argument 'dtype'"
+    ↓
+근본 원인 조사:
+    1. from_pretrained()는 kwargs를 받음
+    2. Line 236: torch_dtype = kwargs.pop("torch_dtype", None)
+       → torch_dtype 파라미터는 추출되어 from_pretrained 내부에서 처리
+    3. dtype 파라미터는 from_pretrained가 인식하지 못함
+       → kwargs에 남아서 __init__()로 전달됨
+    4. Qwen3ForSequenceClassification.__init__(self, config)
+       → config만 받음, dtype 받지 않음
+       → TypeError 발생!
+    ↓
+실험적 검증:
+    Test 1: dtype=torch.bfloat16 → ✗ ERROR
+    Test 2: torch_dtype=torch.bfloat16 → ✓ SUCCESS
+    Test 3: dtype="auto" → ✗ ERROR
+    Test 4: torch_dtype="auto" → ✓ SUCCESS
+    ↓
+결론: transformers 4.52.3에서 공식 파라미터는 torch_dtype만 허용
+    ↓
+해결: dtype=torch_dtype → torch_dtype=torch_dtype 수정
+```
+
+#### 왜 이 버그가 발견되지 않았는가?
+```
+커밋 히스토리 조사:
+    - 7af11f8 "success trainer.evaluate": dtype=torch_dtype 사용
+    - 808592e "refactoy main_yaml.py": dtype=torch_dtype 유지
+    - 00f3742 "change folder level": dtype=torch_dtype 유지
+    - d9b75b5 "success node process": dtype=torch_dtype 유지
+    ↓
+가설 1: 체크포인트에서 resume했을 가능성
+    - checkpoint = get_last_checkpoint(output_dir)
+    - 기존 체크포인트가 있으면 from_pretrained가 호출 안 될 수 있음
+    ↓
+가설 2: 실제로 처음부터 학습을 실행 안 해봤을 가능성
+    - 커밋 메시지 "success trainer.evaluate"
+    - evaluate만 실행하면 모델 초기화 건너뛸 수 있음
+    ↓
+가설 3: 리팩토링 시 코드 복사 오류
+    - 808592e "refactoy main_yaml.py": 259줄 감소
+    - 대규모 리팩토링 중 파라미터 이름 잘못 복사
+    ↓
+확인된 사실:
+    - 커밋 00f3742에도 dtype=torch_dtype 코드 존재
+    - transformers 4.52.3에서는 dtype 파라미터 작동 안 함 (실험 검증)
+    - 따라서 이 코드로는 처음부터 학습이 불가능
+    ↓
+결론: 잠재 버그(latent bug)였음
+    - 코드는 커밋되었지만 실제 실행 경로 테스트 안 됨
+    - Python 3.12 환경 재구성 후 처음으로 발견
+```
+
+#### dtype vs torch_dtype 파라미터 차이 상세
+```
+transformers.modeling_utils.PreTrainedModel.from_pretrained() 처리 흐름:
+
+Step 1: 파라미터 추출 (Line 236)
+    torch_dtype = kwargs.pop("torch_dtype", None)  ✓ 공식 파라미터
+    # dtype는 어디에도 없음!
+
+Step 2: torch_dtype 파라미터 사용
+    Line 598: config, torch_dtype, dtype_orig = _get_torch_dtype(...)
+    Line 612: 내부에서 torch_dtype 사용
+    Line 694: dtype=torch_dtype로 load_state_dict 호출
+
+Step 3: 모델 클래스 초기화
+    model = model_class(config, **remaining_kwargs)
+
+    만약 kwargs에 dtype가 남아있으면:
+        model = Qwen3ForSequenceClassification(config, dtype=...)
+        ↓
+        Qwen3ForSequenceClassification.__init__(self, config):
+            TypeError! (dtype 파라미터 받지 않음)
+
+핵심 차이:
+    torch_dtype:
+        ✓ from_pretrained에서 인식하는 공식 파라미터
+        ✓ kwargs에서 pop되어 from_pretrained 내부에서 처리
+        ✓ __init__로 전달되지 않음
+        ✓ Line 694에서 load_state_dict에 dtype으로 전달됨
+
+    dtype:
+        ✗ from_pretrained가 모르는 파라미터
+        ✗ kwargs에 남아서 __init__로 전달됨
+        ✗ __init__가 받지 않으므로 TypeError
+```
+
+#### Transformers 라이브러리 설계 철학
+```
+책임 분리 (Separation of Concerns):
+    from_pretrained():
+        - 모델 가중치 로딩
+        - Dtype 변환
+        - Device 배치
+        - Sharding 처리
+        - Config 생성
+        → 복잡한 초기화 로직 담당
+
+    __init__():
+        - 순수 객체 생성
+        - Config만 받음
+        - 최소한의 파라미터
+        → 단순하고 예측 가능
+    ↓
+Why it matters:
+    - 가중치 로딩과 객체 생성 분리 → 코드 명확성
+    - __init__는 테스트 가능 (가중치 없이도 모델 생성 가능)
+    - from_pretrained는 프로덕션 사용 (가중치 + 설정 자동 처리)
+```
+
+#### 버그 수정 및 검증
+```
+수정 전:
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=artifacts.num_labels,
+        dtype=torch_dtype,  # ✗ BUG
+        trust_remote_code=model_cfg.get("trust_remote_code", False),
+    )
+
+수정 후:
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=artifacts.num_labels,
+        torch_dtype=torch_dtype,  # ✓ CORRECT
+        trust_remote_code=model_cfg.get("trust_remote_code", False),
+    )
+
+검증:
+    - Qwen3-8B 모델로 테스트
+    - dtype=torch.bfloat16 → TypeError
+    - torch_dtype=torch.bfloat16 → Success (모델 로드 성공)
+    - dtype="auto" → TypeError
+    - torch_dtype="auto" → Success
+    ↓
+결론: torch_dtype가 유일한 정답
+```
+
+#### 기술적 교훈
+**Code Review Lessons**:
+1. **파라미터 이름 검증**: 라이브러리 공식 파라미터 이름 확인 필수
+2. **실행 경로 테스트**: 모든 코드 경로를 실제로 실행해야 버그 발견 가능
+3. **API 문서 참조**: 추측하지 말고 공식 문서의 파라미터 이름 사용
+
+**Testing Strategy**:
+1. **처음부터 학습 테스트**: 체크포인트 없는 상태에서 실행 필수
+2. **환경 재구성 검증**: 새 환경에서 전체 파이프라인 실행하여 잠재 버그 발견
+3. **파라미터 실험**: 의심스러운 파라미터는 실험적으로 검증
+
+**Documentation Value**:
+1. **근본 원인 기록**: dtype vs torch_dtype 차이를 상세히 문서화
+2. **인과 체인 명확화**: 왜 에러가 발생했는지 단계별로 설명
+3. **재현 가능성**: 동일한 실수 방지를 위한 체크리스트 제공
+
+#### 수정된 파일
+**Core Fix**:
+- `/home/user/projects/kedro_project/account-tax/src/account_tax/utils/common.py`
+  - Line 553: `dtype=torch_dtype` → `torch_dtype=torch_dtype`
+  - Function: `initialize_model()` in Block 4
+
+**Related Investigation**:
+- Checked transformers 4.52.3 source code (modeling_utils.py Line 236)
+- Verified Qwen3ForSequenceClassification.__init__ signature
+- Confirmed with experimental tests (4 test cases)
+
+#### 참고 자료
+**Transformers Documentation**:
+- v4.10.1: https://huggingface.co/transformers/v4.10.1/main_classes/model.html
+  - Documents `torch_dtype` parameter explicitly
+- Latest (main branch): Uses `dtype` in examples (미래 버전, 아직 미릴리즈)
+
+**Qwen Model**:
+- Qwen3-8B model: trust_remote_code=True 필요
+- __init__ signature: `__init__(self, config)` only
+
+**Transformers Version**:
+- Current: 4.52.3
+- torch_dtype parameter: Supported since v4.7.0
+- dtype parameter: Not supported in 4.52.3 (future feature)
+
 #### 기술적 교훈
 **Checkpoint Resume Best Practices**:
 1. **자동 감지 우선**: checkpoint_path=null로 시작 → 편의성 극대화

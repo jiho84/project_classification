@@ -1,21 +1,45 @@
-kedro==1.0.0
-kedro-datasets[pandas]>=1.0.0
-pandas>=1.3.0
-scikit-learn>=1.0.0
-numpy>=1.21.0
-pyarrow>=19.0.0,<20.0.0
-mlflow>=2.22,<3.0
-mlflow-skinny>=2.22,<3.0
-datasets>=3.0.0,<3.1.0
-kedro-mlflow>=1.0.0,<1.1.0
-holidays>=0.81
+# Core ML/DL frameworks
+torch==2.7.0
+transformers==4.52.3
+accelerate==1.7.0
+deepspeed==0.17.0
+peft==0.15.2
+bitsandbytes==0.46.0
 
-# HuggingFace dependencies for NLP
-transformers>=4.44.0  # For Qwen3 support (released June 2024)
-torch>=2.0.0  # For torch.compile support
-accelerate>=0.25.0  # For model parallelism and optimization
-peft>=0.7.0  # For LoRA and parameter-efficient fine-tuning
-deepspeed>=0.12.0  # For distributed training optimization
-safetensors>=0.4.0  # For safe model serialization
-sentencepiece>=0.1.99  # Some models require this tokenizer
-protobuf>=3.20.0  # Required by some tokenizers
+# Data processing
+pandas==2.2.3
+numpy==2.2.6
+pyarrow==19.0.1
+datasets==3.0.0
+
+# Machine Learning
+scikit-learn==1.6.1
+scipy==1.15.3
+
+# Kedro ecosystem
+kedro==1.0.0
+kedro-datasets==7.0.0
+kedro-telemetry==0.6.3
+kedro_mlflow==1.0.1
+
+# MLflow
+mlflow==2.22.2
+
+# Visualization
+matplotlib==3.10.3
+
+# Cloud/Database
+google-cloud-bigquery==3.34.0
+databricks-sdk==0.58.0
+pandas-gbq==0.29.2
+
+# API/Web
+fastapi==0.116.1
+Flask==3.1.1
+gunicorn==23.0.0
+uvicorn==0.35.0
+
+# Utilities
+holidays==0.81
+openpyxl==3.1.5
+tqdm==4.67.1

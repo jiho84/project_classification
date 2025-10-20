@@ -63,8 +63,8 @@ train:
     num_train_epochs: 1  # Train for 3 complete epochs (approx 69k steps total)
     per_device_train_batch_size: 8  # Reduced for Qwen3-8B (16→12)
     per_device_eval_batch_size: 8
-    gradient_accumulation_steps: 4  # Increased to maintain effective batch (2→3)
-    learning_rate: 2.0e-5  # Baseline LR for batch 32
+    gradient_accumulation_steps: 6  # Increased to maintain effective batch (2→3)
+    learning_rate: 30e-5  # Baseline LR for batch 32
     weight_decay: 0.002  # Baseline weight decay
     warmup_ratio: 0.02  # 5% warmup (industry standard for full training)
     lr_scheduler_type: "cosine"

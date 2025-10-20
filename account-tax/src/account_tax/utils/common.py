@@ -550,7 +550,7 @@ def initialize_model(
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=artifacts.num_labels,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         trust_remote_code=model_cfg.get("trust_remote_code", False),
     )
 

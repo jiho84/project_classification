@@ -68,3 +68,6 @@ account-tax/data/
 account-tax/mlruns/
 account-tax/.viz/
 account-tax/profiling_*.json
+
+# Backup folders (exclude large files)
+backup/
