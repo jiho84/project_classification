@@ -429,13 +429,13 @@ def setup_training_context(args: argparse.Namespace, cfg: Dict[str, Any]) -> Tra
 
 def load_datasets(
     context: TrainingContext,
-    logger: logging.Logger,
+    logger: Any,  # logging.Logger or RankZeroLogger
 ) -> TrainingArtifacts:
     """Block 2: Load tokenized datasets from disk.
 
     Args:
         context: Training context with data config
-        logger: Logger instance
+        logger: Logger instance (use logger_zero for rank 0 only)
 
     Returns:
         TrainingArtifacts with train/eval/test datasets
@@ -465,14 +465,14 @@ def load_datasets(
 def initialize_tokenizer(
     context: TrainingContext,
     artifacts: TrainingArtifacts,
-    logger: logging.Logger,
+    logger: Any,  # logging.Logger or RankZeroLogger
 ) -> TrainingArtifacts:
     """Block 3: Initialize and configure tokenizer.
 
     Args:
         context: Training context with model config
         artifacts: Artifacts with datasets
-        logger: Logger instance
+        logger: Logger instance (use logger_zero for rank 0 only)
 
     Returns:
         Updated artifacts with tokenizer and num_labels
@@ -515,7 +515,7 @@ def initialize_tokenizer(
 def initialize_model(
     context: TrainingContext,
     artifacts: TrainingArtifacts,
-    logger: logging.Logger,
+    logger: Any,  # logging.Logger or RankZeroLogger
 ) -> TrainingArtifacts:
     """Block 4: Initialize base model without optimization.
 
@@ -525,7 +525,7 @@ def initialize_model(
     Args:
         context: Training context with model config
         artifacts: Artifacts with tokenizer and num_labels
-        logger: Logger instance
+        logger: Logger instance (use logger_zero for rank 0 only)
 
     Returns:
         Updated TrainingArtifacts with base model
@@ -570,14 +570,14 @@ def initialize_model(
 def apply_lora_to_model(
     context: TrainingContext,
     artifacts: TrainingArtifacts,
-    logger: logging.Logger,
+    logger: Any,  # logging.Logger or RankZeroLogger
 ) -> TrainingArtifacts:
     """Block 5: Apply LoRA optimization to model if configured.
 
     Args:
         context: Training context with LoRA config
         artifacts: Artifacts with base model
-        logger: Logger instance
+        logger: Logger instance (use logger_zero for rank 0 only)
 
     Returns:
         Updated artifacts with LoRA-optimized model
